@@ -535,7 +535,7 @@ def dump_groups(rs, title: str, counts: dict, examples: dict):
             if ex_str:
                 rs.print_startup_warning(f"• ({cnt} шт.) {msg}\n Примеры строк: {ex_str}{tail}")
             else:
-                rs.print_startup_warning(f"• ({cnt} шт.) {msg})    
+                rs.print_startup_warning(f"• ({cnt} шт.) {msg}")    
 
 
 # -------------------------------------------------
@@ -571,6 +571,11 @@ def main():
 
   
     for csv_file in files:
+        
+        # Группировка всех проблем
+        counts = defaultdict(int)    # текст проблемы -> сколько раз
+        examples = defaultdict(list) # текст проблемы -> список строк-примеров (до лимита)
+
         precheck_report_path = report_dir / f"{csv_file.stem}_PRECHECK.txt"
 
         # 1) читаем файл как текст
@@ -580,9 +585,7 @@ def main():
         with open(precheck_report_path, "w", encoding="utf-8-sig") as f:
             rs = ReportService(output=f)
 
-              # Группировка всех проблем
-            counts = defaultdict(int)    # текст проблемы -> сколько раз
-            examples = defaultdict(list) # текст проблемы -> список строк-примеров (до лимита)
+            
             rs.print_startup_warning(f"Проверка файла: {csv_file.name}")
             if enc.lower().startswith("utf-8"):
                 rs.print_startup_warning("Кодировка: UTF-8")
@@ -666,42 +669,47 @@ def main():
                     continue
 
                 total += 1
+                row_has_problem = False  
 
-                # Приводим к 16 колонкам, но фиксируем проблему 
+                # 1) Проверка количества колонок 
                 if len(row) < len(COLUMN_NAMES):
-                    add_group(
-                        counts, examples,
-                        f"Строка имеет меньше колонок: {len(row)} вместо {len(COLUMN_NAMES)} (строку нельзя корректно проверить)",
-                        line_no=i
+                    row_has_problem = True
+                    rs.print_error(
+                        f"Строка {i}: количество колонок  = {len(row)}, ожидается {len(COLUMN_NAMES)} "
+                        "(не хватает колонок)"
                     )
-                    # дополним пустыми, чтобы validate_row_rules нашел пустые обязательные поля
                     row16 = row + [""] * (len(COLUMN_NAMES) - len(row))
-
+                                        
                 elif len(row) > len(COLUMN_NAMES):
-                    add_group(
-                        counts, examples,
-                        f"Строка имеет лишние колонки: +{len(row) - len(COLUMN_NAMES)}",
-                        line_no=i
-                    )
+                    row_has_problem = True
+                    if not extra_cols_noted:
+                        rs.print_startup_warning(
+                            f"Обнаружены лишние колонки в строках (пример: строка {i}: + {len(row) - len(COLUMN_NAMES)}). "
+                            "Лишнее игнорируется"
+                        )
+                                                       
                     row16 = row[:len(COLUMN_NAMES)]
 
                 else:
                     row16 = row
 
+                # 2) логические правила заполнения
                 errs = validate_row_rules(row16)
-                
                 if errs:
-                    bad += 1
+                    row_has_problem = True
                     for e in errs:
-                    add_group(counts, examples, e, line_no=i)
+                    add_group(counts, examples, e, i)
 
-                    # но все равно поробуем проверим то, что невозможно: дополним пустыми до 16
-                    # row16 = row + [""] * (len(COLUMN_NAMES) - len(row))
+                # 3) финально считаем строку "битой"
+                if row_has_problem:
+                    bad += 1    
+
+                   
 
             rs.print_startup_warning(f"Итого строк данных: {total}")
             rs.print_startup_warning(f"Строк с ошибками: {bad}")
 
-            dump_groups(rs. "Сводка проблем (сгруппировано)", counts, examples)
+            dump_groups(rs, "Сводка проблем (сгруппировано)", counts, examples)
 
         print("Отчет сохранен:", precheck_report_path)
 
