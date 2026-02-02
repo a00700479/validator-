@@ -202,9 +202,9 @@ def precheck_filling_and_logic(row: dict, rownum: int) -> list[str]:
     if contains_token(method, "curl") and is_empty(row.get("URL проверки")):
         errors.append(f"Строка {rownum}: указан curl, но URL проверки не указан")
 
-    if contains_token(method, "telnet") and is_empty(row.get("Проверочный IP+порт")):
+    if contains_token(method, "telnet") and is_empty(row.get("Проверочный IP+Порт")):
         errors.append(
-            f"Строка {rownum}: указан telnet, но Проверочный IP+порт не указан"
+            f"Строка {rownum}: указан telnet, но Проверочный IP+Порт не указан"
         )
 
     if contains_token(method, "dig") and is_empty(row.get("DNS Host")):
@@ -569,12 +569,7 @@ def main():
     report_dir = Path(r"C:\Users\user\Documents\White list\reports")
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    # Группировка всех проблем
-    counts = defaultdict(int)    # текст проблемы -> сколько раз
-    examples = defaultdict(list) # текст проблемы -> список строк-примеров (до лимита)
-
-
-
+  
     for csv_file in files:
         precheck_report_path = report_dir / f"{csv_file.stem}_PRECHECK.txt"
 
@@ -584,6 +579,10 @@ def main():
         # 2) открываем отчет и записываем грамотно
         with open(precheck_report_path, "w", encoding="utf-8-sig") as f:
             rs = ReportService(output=f)
+
+              # Группировка всех проблем
+            counts = defaultdict(int)    # текст проблемы -> сколько раз
+            examples = defaultdict(list) # текст проблемы -> список строк-примеров (до лимита)
             rs.print_startup_warning(f"Проверка файла: {csv_file.name}")
             if enc.lower().startswith("utf-8"):
                 rs.print_startup_warning("Кодировка: UTF-8")
