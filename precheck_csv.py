@@ -220,10 +220,6 @@ def cell(row: list[str], idx: int) -> str:
     return (row[idx] if idx < len(row) else "").strip()
 
 
-def is_empty(s: str) -> bool:
-    return s.strip() == ""
-
-
 def split_csv_list(value: str) -> list[str]:
     """
     Разбивает список значений в одной ячейке.
@@ -354,13 +350,20 @@ def validate_row_rules(row: list[str]) -> list[str]:
         # - telnet: обязателен Проверочный IP+Порт; URL обычно пуст
         if is_empty(check_ipport):
             # строгий режим: порт в IP+Port должен совпадать с колонкой Port
-            if not is_empty(port) and not is_empty(check_ipport):
-                try:
-                    port_int = int(port)
-                except ValueError:
-                    errs.append("Port должен быть числом, получено: '{port}'")
-                    port_int = None
-
+            errs.append("Указан telnet, но ячейка 'Проверочный IP+Порт' пустая")
+        else:
+            ip2, p2 = _parse_ip_port(check_ipport)
+            if ip2 is None:
+                errs.append("telnet: 'Проверочный IP+Порт' должен быть IPv4:Port (например 1.2.3.4:443)")
+            else:
+                if not is_empty(port):               
+                    try:
+                        port_int = int(port)
+                        if port_int != p2:
+                            errs.append(f"telnet: Port={port_int}, но в 'Проверочный IP+Порт' порт {p2} (должны совпадать)")
+                    except ValueError:
+                        errs.append("Port должен быть числом, получено: '{port}'")
+                   
                 ip2, p2 = _parse_ip_port(check_ipport)
                 if port_int is not None and p2 is not None and port_int != p2:
                     errs.append(
@@ -550,7 +553,7 @@ def main():
     inp = Path(args.input)
 
     # Защита: проверяем, что это CSV или папка с CSV
-    if inp.is_file:
+    if inp.is_file():
         if inp.suffix.lower() != ".csv":
             print("ОШИБКА: Входной файл не является CSV:", inp.name)
             print("Пожалуйста, перетащите файл с расширением .csv")
@@ -565,6 +568,12 @@ def main():
 
     report_dir = Path(r"C:\Users\user\Documents\White list\reports")
     report_dir.mkdir(parents=True, exist_ok=True)
+
+    # Группировка всех проблем
+    counts = defaultdict(int)    # текст проблемы -> сколько раз
+    examples = defaultdict(list) # текст проблемы -> список строк-примеров (до лимита)
+
+
 
     for csv_file in files:
         precheck_report_path = report_dir / f"{csv_file.stem}_PRECHECK.txt"
@@ -651,10 +660,7 @@ def main():
             total = 0
             bad = 0
 
-            # Группировка всех проблем
-            counts = defaultdict(int)    # текст проблемы -> сколько раз
-            examples = defaultdict(list) # текст проблемы -> список строк-примеров (до лимита)
-
+            
             for i, row in enumerate(rows, start=2):  # start=2 потому что 1- заголовок
                 # пропускаем полностью пустые строки
                 if all((c or "").strip() == "" for c in row):
