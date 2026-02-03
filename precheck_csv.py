@@ -21,6 +21,8 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+import pandas as pd
+from openpyxl import load_workbook
 from collections import defaultdict
 
 from services.report_service import ReportService
@@ -158,6 +160,83 @@ def build_lenient_mapping(actual: list[str], expected: list[str]):
         return None, problems
 
     return mapping, []
+
+
+def normalized_header_for_fixed(
+    actual_header: list[str], expected: list[str]
+) -> tuple[list[str], list[str]]:
+    """
+    Возвращает:
+      - fixed_header: заголовок ровно как expected (если удалось сопоставить)
+      - problems: список проблем (если не удалось)
+    """
+    # Сначала попробуем "мягкое сопоставление"
+    mapping, problems = build_lenient_mapping(actual_header[: len(expected)], expected)
+    if problems:
+        # Мягко не получилось - вернем строгие несовпадения как проблемы
+        mism = compare_headers_strict(actual_header[: len(expected)], expected)
+        problems2 = [
+            f"Колонка {i}: ожидается '{exp}', получено '{act}'"
+            for (i, exp, act) in mism
+            if exp != act
+        ]
+        return expected[:], (problems + problems2)
+
+    # Если mapping есть — значит различия только в регистре/пробелах/BOM
+    # FIXED заголовок должен быть строго expected
+    return expected[:], []
+
+
+def build_fixed_csv(
+    csv_file: Path,
+    text: str,
+    delim: str,
+    expected_cols: list[str],
+    out_dir: Path,
+) -> Path:
+    """
+    Делает временный CSV, который "съест" main.py:
+    - заголовок приводим к expected_cols (по позиции)
+    - строки обрезаем до 16 или дополняем пустыми до 16
+    - лишние колонки от хвостовых ||| игнорируем
+    - пишем UTF-8 (без BOM) c тем же разделителем '|'
+    """
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fixed_path = out_dir / f"{csv_file.stem}_FIXED.csv"
+
+    lines = text.splitlines()
+    if not lines:
+        raise ValueError("Файл пустой")
+
+    reader = csv.reader(lines, delimiter=delim)
+    rows = list(reader)
+    if not rows:
+        raise ValueError("Не удалось прочитать CSV")
+
+    header = rows[0]
+    data_rows = rows[1:]
+
+    # нормализуем заголовки и приводим к длине expected
+    header = [normalized_header_for_fixed(x) for x in header]
+    header16 = (header + [""] * len(expected_cols))[: len(expected_cols)]
+
+    # ВАЖНО: чтобы main.py не падал на заголовках — делаем их ровно ожидаемыми
+    header16 = expected_cols[:]  # именно так: фиксируем строго
+
+    fixed_rows = [header16]
+
+    for r in data_rows:
+        # обрезаем/дополняем до 16
+        r16 = (r + [""] * len(expected_cols))[: len(expected_cols)]
+        fixed_rows.append(r16)
+
+    # пишем как UTF-8 без BOM, newline = "" важно для csv в винде
+    with open(fixed_path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, delimiter="|", quoting=csv.QUOTE_MINIMAL)
+        w.writerows(fixed_rows)
+
+    return fixed_path
 
 
 # -------------------------------------------------
@@ -350,30 +429,14 @@ def validate_row_rules(row: list[str]) -> list[str]:
         # - telnet: обязателен Проверочный IP+Порт; URL обычно пуст
         if is_empty(check_ipport):
             # строгий режим: порт в IP+Port должен совпадать с колонкой Port
-            errs.append("Указан telnet, но ячейка 'Проверочный IP+Порт' пустая")
-        else:
-            ip2, p2 = _parse_ip_port(check_ipport)
-            if ip2 is None:
-                errs.append(
-                    "telnet: 'Проверочный IP+Порт' должен быть IPv4:Port (например 1.2.3.4:443)"
-                )
-            else:
-                if not is_empty(port):
-                    try:
-                        port_int = int(port)
-                        if port_int != p2:
-                            errs.append(
-                                f"telnet: Port={port_int}, но в 'Проверочный IP+Порт' порт {p2} (должны совпадать)"
-                            )
-                    except ValueError:
-                        errs.append("Port должен быть числом, получено: '{port}'")
+            if is_empty(check_ipport):
+                errs.append("Указан telnet, но ячейка 'Проверочный IP+Порт' пустая")
+            # URL не нужен, но не считаем ошибкой, если заполнен
 
     if "ping" in methods:
         # - ping: нужен IP (берем из Проверочный IP+Порт)
-        if is_empty(check_ipport):
-            errs.append(
-                "Указан ping, но ячейка 'Проверочный IP+Порт' пустая (нужен IP для проверки)"
-            )
+        if is_empty(check_ipport) and is_empty(dns):
+            errs.append("Указан ping, но нет ни IP, ни DNS для проверки")
 
     if "dig" in methods:
         # - dig: нужен DNS Host (или SNI/HTTP HOST), URL не нужен
@@ -406,12 +469,19 @@ def validate_row_rules(row: list[str]) -> list[str]:
             errs.append(
                 f"URL проверки при curl должен начинаться с http:// или https:// (получено: '{url}')"
             )
+        if is_empty(dns):
+            errs.append("Указан curl, о не заполнен 'DNS Host'")
     else:
-        # для всех остальных методов URL должен быть пустым
+        # для всех остальных методов URL НЕ обязателен
+        # но если заполнен - просто проверим, что это похоже на URL
         if not is_empty(url):
-            errs.append(
-                f"URL проверки должно быть пустым для метода(ов) {methods} (получено: '{url}')"
-            )
+            if not (
+                url.lower().startswith("http://")
+                or url.lower().startswith("https://")
+                or "." in url  # разрешаем домены типа v-a.yandex.ru
+            ):
+
+                errs.append(f"URL проверки имеет формат: '{url}')")
     return errs
 
 
@@ -420,19 +490,28 @@ def validate_row_rules(row: list[str]) -> list[str]:
 # -------------------------------------------------
 
 
-def run_main_validator(temp_csv: Path, output_csv: Path):
+def run_main_validate(
+    project_dir: Path,
+    fixed_csv: Path,
+    out_csv: Path,
+    skip_whois: bool = True,
+) -> tuple[str, int]:
+    """
+    Запускает main.py validate и возвращает (stdout + stderr, returncode)
+    """
     cmd = [
         sys.executable,
-        "main.py",
+        str(project_dir / "main.py"),
         "validate",
         "--input",
-        str(temp_csv),
+        str(fixed_csv),
         "--output",
-        str(output_csv),
-        "--skip-whois",
+        str(out_csv),
     ]
+    if skip_whois:
+        cmd.append("--skip-whois")
 
-    env = dict(os.environ)
+    env = dict(**dict(os.environ))
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
 
@@ -443,6 +522,7 @@ def run_main_validator(temp_csv: Path, output_csv: Path):
         encoding="utf-8",
         errors="replace",
         env=env,
+        cwd=str(project_dir),  # важно: main.py любит запуск из своей папки
     )
     return (p.stdout or "") + (p.stderr or ""), p.returncode
 
@@ -541,6 +621,49 @@ def dump_groups(rs, title: str, counts: dict, examples: dict):
             rs.print_startup_warning(f"• ({cnt} шт.) {msg}")
 
 
+def build_excel_report(
+    main_csv: Path,
+    excel_path: Path,
+    sep: str,
+    precheck_txt: Path | None = None,
+    main_log_txt: Path | None = None,
+) -> None:
+    """
+    Делает Excel-отчёт:
+      - MAIN_RESULT: таблица из main.csv
+      - MAIN_LOG: лог main.py (если есть)
+      - PRECHECK: precheck-отчёт (если есть)
+    """
+    excel_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1) Таблица main.py -> Excel
+    df = pd.read_csv(main_csv, sep=sep, encoding="utf-8")
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="MAIN_RESULT", index=False)
+
+    # 2) Добавляем текстовые листы
+    wb = load_workbook(excel_path)
+
+    def add_text_sheet(sheet_name: str, txt_path: Path):
+        if not txt_path or not txt_path.exists():
+            return
+        ws = wb.create_sheet(sheet_name)
+        text = txt_path.read_text(encoding="utf-8", errors="replace")
+        # пишем построчнов колонку А\
+        for i, line in enumerate(text.splitlines(), start=1):
+            ws.cell(row=i, column=1, value=line)
+
+    add_text_sheet("MAIN_LOG", main_log_txt)
+    add_text_sheet("PRECHECK", precheck_txt)
+
+    # Удобно: закрепим шапку таблицы
+    ws0 = wb["MAIN_RESULT"]
+    ws0.freeze_panes = "A2"
+    ws0.auto_filter.ref = ws0.dimensions
+
+    wb.save(excel_path)
+
+
 # -------------------------------------------------
 # ЕДИНАЯ ТОЧКА ВХОДА
 # -------------------------------------------------
@@ -603,20 +726,13 @@ def main():
             header_line = lines[0] if lines else ""
 
             # по ТЗ разделитель строго |
-            if "|" not in header_line:
-                rs.print_error(
-                    'Ошибка формата: не обнаружен обязательный разделитель "|".'
-                    "Файл должен быть сохранен как CSV с разделителем |"
-                )
-                continue
-
-            # detect_delimiter может вернуть None или (delim, counts) — обрабатываем оба случая
-            det = detect_delimiter(header_line)
-            if det is None:
-                rs.print_error("Не удалось определить разделитель")
-                continue
 
             delim = "|"
+            if "|" not in header_line:
+                rs.print_error(
+                    "Не найден разделитель '|'. Файл должен быть сохранен как CSV с разделителем |"
+                )
+                continue
 
             # 3) Парсим CSV
             rows, header = parse_rows(text, delim)
@@ -679,7 +795,7 @@ def main():
                     add_group(
                         counts,
                         examples,
-                        f"Строки: лишние колонки (больше {len(COLUMN_NAMES)})",
+                        f"Строки: не хватает колонок (меньше {len(COLUMN_NAMES)})",
                         i,
                     )
                     row16 = row + [""] * (len(COLUMN_NAMES) - len(row))
@@ -716,6 +832,62 @@ def main():
 
             rs.print_startup_warning(f"Итого строк данных: {total}")
             rs.print_startup_warning(f"Строк с ошибками: {bad}")
+
+            # 6) Готовим FIXED CSV и запускаем main.py
+
+            fixed_dir = report_dir / "_temp"
+            main_out_csv = report_dir / f"{csv_file.stem}_MAIN_result.csv"
+            main_log_txt = report_dir / f"{csv_file.stem}_MAIN.txt"
+
+            try:
+                fixed_csv = build_fixed_csv(
+                    csv_file=csv_file,
+                    text=text,
+                    delim=delim,  # тот, который мы определили
+                    expected_cols=COLUMN_NAMES,  # 16 наших ожидаемых
+                    out_dir=fixed_dir,
+                )
+                rs.print_startup_warning(
+                    f"Создан FIXED CSV для main.py:  {fixed_csv.name}"
+                )
+
+                main_log, rc = run_main_py_validate(
+                    project_dir=Path(__file__).parent,  # папка, где лежит main.py
+                    fixed_csv=fixed_csv,
+                    out_csv=main_out_csv,
+                    skip_whois=True,
+                )
+
+                # пишем отдельный лог main.py
+                main_log_txt.write_text(main_log, encoding="utf-8")
+
+                if rc == 0:
+                    rs.print_startup_warning(f"main.py: OK. Результат: {main_out_csv}")
+                    rs.print_startup_warning(f"Лог main.py: {main_log_txt}")
+                else:
+                    rs.print_error(
+                        f"main.py завершился с кодом {rc}. Cм. лог: {main_log_txt.name}"
+                    )
+
+            except Exception as e:
+                rs.print_error(
+                    f"Не удалось подготовить FIXED CSV / запустить main.py: {e}"
+                )
+
+            main_excel = report_dir / f"{csv_file.stem}_REPORT.xlsx"
+
+            if main_out_csv.exists():
+                try:
+                    build_excel_report(
+                        main_csv=main_out_csv,
+                        excel_path=main_excel,
+                        sep="|",  #  у нас разделитель по форме
+                        precheck_txt=precheck_report_path,
+                        main_log_txt=main_log_txt,
+                    )
+                    rs.print_row_errors(f"Excel-отчет: {main_excel.name}")
+                except Exception as e:
+                    rs.print_error(f"Не удалось соборать Excel-отчет: {e}")
 
             dump_groups(rs, "Сводка проблем (сгруппировано)", counts, examples)
 
