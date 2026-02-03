@@ -354,21 +354,19 @@ def validate_row_rules(row: list[str]) -> list[str]:
         else:
             ip2, p2 = _parse_ip_port(check_ipport)
             if ip2 is None:
-                errs.append("telnet: 'Проверочный IP+Порт' должен быть IPv4:Port (например 1.2.3.4:443)")
+                errs.append(
+                    "telnet: 'Проверочный IP+Порт' должен быть IPv4:Port (например 1.2.3.4:443)"
+                )
             else:
-                if not is_empty(port):               
+                if not is_empty(port):
                     try:
                         port_int = int(port)
                         if port_int != p2:
-                            errs.append(f"telnet: Port={port_int}, но в 'Проверочный IP+Порт' порт {p2} (должны совпадать)")
+                            errs.append(
+                                f"telnet: Port={port_int}, но в 'Проверочный IP+Порт' порт {p2} (должны совпадать)"
+                            )
                     except ValueError:
                         errs.append("Port должен быть числом, получено: '{port}'")
-                   
-                ip2, p2 = _parse_ip_port(check_ipport)
-                if port_int is not None and p2 is not None and port_int != p2:
-                    errs.append(
-                        f"telnet: Port={port_int}, но в Проверочный IP+Порт указан порт {p2} (должны совпадать)"
-                    )
 
     if "ping" in methods:
         # - ping: нужен IP (берем из Проверочный IP+Порт)
@@ -511,7 +509,9 @@ class FileOutcome:
     file: Path
     ran_validator: bool
 
+
 MAX_EXAMPLES_PER_TYPE = 15
+
 
 def add_group(counts: dict, examples: dict, key: str, line_no: int | None = None):
     """Увеличивает счетчик ошибок и сохраняет номера строк-примеров"""
@@ -519,23 +519,26 @@ def add_group(counts: dict, examples: dict, key: str, line_no: int | None = None
     if line_no is not None and len(examples[key]) < MAX_EXAMPLES_PER_TYPE:
         examples[key].append(line_no)
 
+
 def dump_groups(rs, title: str, counts: dict, examples: dict):
     """Печатает сгруппированные ошибки по убыванию частоты"""
     if not counts:
         rs.print_startup_warning(f"{title}: нет")
         return
-    
+
     rs.print_startup_warning(title + ":")
 
     # сортируем по количеству (самые частые сверху)
     for msg, cnt in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
-            ex = examples.get(msg, [])
-            ex_str = ", ".join(str(x) for x in ex)
-            tail = " ..." if cnt > len(ex) else ""
-            if ex_str:
-                rs.print_startup_warning(f"• ({cnt} шт.) {msg}\n Примеры строк: {ex_str}{tail}")
-            else:
-                rs.print_startup_warning(f"• ({cnt} шт.) {msg}")    
+        ex = examples.get(msg, [])
+        ex_str = ", ".join(str(x) for x in ex)
+        tail = " ..." if cnt > len(ex) else ""
+        if ex_str:
+            rs.print_startup_warning(
+                f"• ({cnt} шт.) {msg}\n Примеры строк: {ex_str}{tail}"
+            )
+        else:
+            rs.print_startup_warning(f"• ({cnt} шт.) {msg}")
 
 
 # -------------------------------------------------
@@ -569,12 +572,13 @@ def main():
     report_dir = Path(r"C:\Users\user\Documents\White list\reports")
     report_dir.mkdir(parents=True, exist_ok=True)
 
-  
     for csv_file in files:
-        
+
         # Группировка всех проблем
-        counts = defaultdict(int)    # текст проблемы -> сколько раз
-        examples = defaultdict(list) # текст проблемы -> список строк-примеров (до лимита)
+        counts = defaultdict(int)  # текст проблемы -> сколько раз
+        examples = defaultdict(
+            list
+        )  # текст проблемы -> список строк-примеров (до лимита)
 
         precheck_report_path = report_dir / f"{csv_file.stem}_PRECHECK.txt"
 
@@ -585,7 +589,6 @@ def main():
         with open(precheck_report_path, "w", encoding="utf-8-sig") as f:
             rs = ReportService(output=f)
 
-            
             rs.print_startup_warning(f"Проверка файла: {csv_file.name}")
             if enc.lower().startswith("utf-8"):
                 rs.print_startup_warning("Кодировка: UTF-8")
@@ -625,32 +628,26 @@ def main():
 
             extra = len(header) - len(COLUMN_NAMES)
             if extra > 0:
-                add_group(
-                    counts, examples,
-                    f"Файл содержит лишние колонки: +{extra}"
-                )
+                add_group(counts, examples, f"Файл содержит лишние колонки: +{extra}")
             elif extra < 0:
                 add_group(
-                    counts, examples,
-                    f"Файл содержит меньше колонок: {len(header)} вместо {len(COLUMN_NAMES)}"
+                    counts,
+                    examples,
+                    f"Файл содержит меньше колонок: {len(header)} вместо {len(COLUMN_NAMES)}",
                 )
-                
-             
+
             # 4) заголовки (НЕ останавливаемся, просто фиксируем)
-            header_for_compare = header[: len(COLUMN_NAMES)]
-            mism = compare_headers_strict(header[:len(COLUMN_NAMES)], COLUMN_NAMES)
+
+            mism = compare_headers_strict(header[: len(COLUMN_NAMES)], COLUMN_NAMES)
             if mism:
                 # одну запись "тип проблемы" + детали отдельными пунктами
                 add_group(counts, examples, "Несовпадение в написании заголовков")
                 for col_no, expected, got in mism:
                     add_group(
-                        counts, examples,
-                        f"Заголовок: колонка {col_no}: ожидается '{expected}', получено '{got}'"
+                        counts,
+                        examples,
+                        f"Заголовок: колонка {col_no}: ожидается '{expected}', получено '{got}'",
                     )
-            else:
-                # можно не добавлять в группировку, чтобы не шуметь 
-                pass        
-                
             else:
                 rs.print_startup_warning("Заголовки: ОК")
 
@@ -662,24 +659,31 @@ def main():
             total = 0
             bad = 0
 
-            
+            extra_cols_noted = False
+
             for i, row in enumerate(rows, start=2):  # start=2 потому что 1- заголовок
                 # пропускаем полностью пустые строки
                 if all((c or "").strip() == "" for c in row):
                     continue
 
                 total += 1
-                row_has_problem = False  
+                row_has_problem = False
 
-                # 1) Проверка количества колонок 
+                # 1) Проверка количества колонок
                 if len(row) < len(COLUMN_NAMES):
                     row_has_problem = True
                     rs.print_error(
                         f"Строка {i}: количество колонок  = {len(row)}, ожидается {len(COLUMN_NAMES)} "
                         "(не хватает колонок)"
                     )
+                    add_group(
+                        counts,
+                        examples,
+                        f"Строки: лишние колонки (больше {len(COLUMN_NAMES)})",
+                        i,
+                    )
                     row16 = row + [""] * (len(COLUMN_NAMES) - len(row))
-                                        
+
                 elif len(row) > len(COLUMN_NAMES):
                     row_has_problem = True
                     if not extra_cols_noted:
@@ -687,8 +691,14 @@ def main():
                             f"Обнаружены лишние колонки в строках (пример: строка {i}: + {len(row) - len(COLUMN_NAMES)}). "
                             "Лишнее игнорируется"
                         )
-                                                       
-                    row16 = row[:len(COLUMN_NAMES)]
+                        add_group(
+                            counts,
+                            examples,
+                            f"Строки: лишние колонки (больше {len(COLUMN_NAMES)})",
+                            i,
+                        )
+
+                    row16 = row[: len(COLUMN_NAMES)]
 
                 else:
                     row16 = row
@@ -698,13 +708,11 @@ def main():
                 if errs:
                     row_has_problem = True
                     for e in errs:
-                    add_group(counts, examples, e, i)
+                        add_group(counts, examples, e, i)
 
                 # 3) финально считаем строку "битой"
                 if row_has_problem:
-                    bad += 1    
-
-                   
+                    bad += 1
 
             rs.print_startup_warning(f"Итого строк данных: {total}")
             rs.print_startup_warning(f"Строк с ошибками: {bad}")
