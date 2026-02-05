@@ -2,159 +2,215 @@ import subprocess
 import re
 import shutil
 from typing import Optional
+
 import pandas as pd
-from tqdm import tqdm
+import sys
 
 from .base import DataFrameValidator
 from config.columns import COLUMNS
 
 
+
 class WhoisCountryValidator(DataFrameValidator):
-    """Валидатор страны по Whois. Проверяет принадлежность IP адреса к России."""
-    
+    """Валидатор страны по IP (RU) через  whois RDAP (ipwhois)"""
+
     def __init__(self):
-        self._whois_available: Optional[bool] = None
         self._warning_shown = False
-        self.IP_PORT_COLUMN = COLUMNS[12].name
-    
+        self._mode_cached: Optional[str] = None  # "cli" | "rdap" | "none"
+        self.IP_PORT_COLUMN = COLUMNS[12].name  # Проверочный IP+Порт
+
     @property
     def name(self) -> str:
         return "WHOIS"
-    
+
     @property
     def description(self) -> str:
-        return "Проверка страны (whois)"
-    
+        return "Проверка страны (whois/rdap)"
+
+    def _detect_mode(self) -> str:
+        """Определяем, чем можем проверять:  ipwahois-rdap / whois-cli / никак"""
+        if self._mode_cached:
+            return self._mode_cached
+
+        # 1) Сначала пробуем RDAP (на Windows это самый стабильный вариант)
+        try:
+            import ipwhois  # noqa: F401
+            self._mode_cached = "rdap"
+            return self._mode_cached
+        except Exception:
+            pass
+
+        # 2) Потом whois-cli (если реально установлен)
+        if shutil.which("whois"):
+            self._mode_cached = "cli"
+            return self._mode_cached
+        
+        # 3) иначе никак
+        self._mode_cached = "none"
+        return self._mode_cached 
+
     def is_available(self) -> bool:
-        """Проверяет, доступна ли команда whois """
-        if self._whois_available is None:
-            self._whois_available = shutil.which("whois") is not None
-        return self._whois_available
-    
+        return self._detect_mode() != "none"
+
     def get_startup_warning(self) -> Optional[str]:
-        """Get warning message if whois is not available."""
-        if not self.is_available() and not self._warning_shown:
+        mode = self._detect_mode()
+        if mode == "none" and not self._warning_shown:
             self._warning_shown = True
             return (
-                "⚠️  ВНИМАНИЕ: в системе отсутствует утилита whois. "
-                "Проверка на принадлежность IP адреса конкретной стране будет пропущена."
+                "⚠️  ВНИМАНИЕ: в системе нет whois (CLI) и не установлен ipwhois. \n"
+                "Проверка страны для IP будет пропущена. \n"
+                "Установите: pip install ipwhois"
             )
         return None
-    
+
     def get_final_warning(self) -> Optional[str]:
-        if not self.is_available():
-            return (
-                "⚠️  Проверка на принадлежность IP адреса конкретной стране не сработала, "
-                "потому что в системе отсутствует whois."
-            )
+        mode = self._detect_mode()
+        if mode == "none":
+            return "⚠️  Проверка страны для IP адреса не выполнялась: нет whois (CLI) и ipwhois."
         return None
-    
+
     def validate(self, df: pd.DataFrame) -> pd.Series:
         """Validate country for each IP using whois."""
         errors = self._empty_errors(df)
-        
-        if not self.is_available():
+
+        mode = self._detect_mode()
+        if mode == "none":
             return errors
-        
+
         if self.IP_PORT_COLUMN not in df.columns:
             return errors
-        
+
         def extract_ip(address: str) -> Optional[str]:
-            if not address or address == "nan":
+            if not address or str(address).strip().lower() == "nan":
                 return None
-            address = address.strip()
-            
-            ipv6_bracket_match = re.match(r'^\[([0-9a-fA-F:]+)\]', address)
-            if ipv6_bracket_match:
-                return ipv6_bracket_match.group(1)
-            
-            ipv4_match = re.match(r'^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)', address)
-            if ipv4_match:
-                return ipv4_match.group(1)
-            
-            ipv6_match = re.match(r'^([0-9a-fA-F:]+)', address)
-            if ipv6_match:
-                candidate = ipv6_match.group(1)
-                if ':' in candidate:
-                    return candidate
-            
+            address = str(address).strip()
+
+            # [IPv6]:port
+            m = re.match(r"^\[([0-9a-fA-F:]+)\]", address)
+            if m:
+                return m.group(1)
+
+            # IPv4[:port]
+            m = re.match(r"^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)", address)
+            if m:
+                return m.group(1)
+
+            # IPv6 (без скобок)
+            m = re.match(r"^([0-9a-fA-F:]+)", address)
+            if m and ":" in m.group(1):
+                return m.group(1)
+                
             return None
-        
-        addresses = df[self.IP_PORT_COLUMN].astype(str).str.strip()
-        ips = addresses.apply(extract_ip)
-        results = []
+
+        ips = df[self.IP_PORT_COLUMN].astype(str).str.strip().apply(extract_ip)
         unique_ips = ips.dropna().unique()
 
-        cache = {}
+        cache: dict[str, Optional[str]] = {}
+        print(f"\n  🌍 Whois/RDAP проверка {len(unique_ips)} уникальных IP...")
         
-        print(f"\n  🌍 Whois проверка {len(unique_ips)} уникальных IP...")
-        for ip in tqdm(unique_ips, desc="  Whois запросы", leave=False, ncols=80):
-            country = self._get_country_from_whois(ip)
+        for ip in unique_ips:
+            country = self._get_country(ip, mode=mode)
             cache[ip] = country
-            status = "✅" if country and country.upper() == "RU" else "❌"
-            country_str = country if country else "N/A"
-            tqdm.write(f"    {status} {ip} -> {country_str}")
-        
+
+            if sys.stdout.isatty():
+                status = "OK" if country and country.upper() == "RU" else "❌"
+                country_str = country if country else "N/A"
+                print (f"    {status} {ip} -> {country_str}")
+  
+           
         def check_country(ip: Optional[str]) -> str:
             if ip is None:
                 return ""
             
             country = cache.get(ip)
-            
+
             if country is None:
                 return self._make_error(
                     f"Не удалось определить страну для IP: {ip}",
-                    "Проверочный IP+Порт"
+                    self.IP_PORT_COLUMN
                 )
             
+            if country == "PRIVATE":
+                return "" # не считаем ошибкой
+
             if country.upper() != "RU":
                 return self._make_error(
                     f"IP {ip} принадлежит стране '{country}', ожидается 'RU'",
-                    "Проверочный IP+Порт"
+                    self.IP_PORT_COLUMN
                 )
-            
+
             return ""
+
+        return ips.apply(check_country)
+
         
-        errors = ips.apply(check_country)
-        return errors
-    
-    def _get_country_from_whois(self, ip: str, timeout: int = 10) -> Optional[str]:
+    def _get_country(self, ip: str, mode: str, timeout: int = 10) -> Optional[str]:
         """
-        run whois command with -r option and return country code
+        Возвращает код страны (например RU/US) или None
         """
+        if mode == "cli":
+            return self._get_country_from_whois_cli(ip, timeout=timeout)
+        if mode == "rdap":
+            return self._get_country_from_rdap(ip, timeout=timeout)
+        return None
+
+    def _get_country_from_rdap(self, ip: str, timeout: int = 10) -> Optional[str]:
+        try:
+            from ipwhois import IPWhois
+            from ipwhois.exceptions import IPDefinedError
+
+            try: 
+                obj = IPWhois(ip, timeout=timeout)
+
+                # 1) RDAP (быстро)
+                rdap = obj.lookup_rdap()
+                net = rdap.get("network") or {}
+                net_cc = (net.get("country") or "").strip()
+                if net_cc:
+                    return str(net_cc).upper()
+
+                # 2) fallback: WHOIS parsing (чаще совпадает с RIPE "country:")
+                who = obj.lookup_whois()
+                nets = who.get("nets") or []
+                for n in nets:
+                    cc = (n.get("country") or "").strip()
+                    if cc:
+                        return cc.upper()
+
+                return None
+
+            except IPDefinedError:
+                return "PRIVATE"
+
+        except Exception:
+            return None         
+
+    def _get_country_from_whois_cli(self, ip: str, timeout: int = 10) -> Optional[str]:
         try:
             result = subprocess.run(
                 ["whois", "-r", ip],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=timeout,
-                text=True
+                text=True,
             )
-            
-            output = result.stdout
-            
+
+            output = result.stdout or ""
+
             # 1. Основная проверка на наличие страны в выводе whois
-            match = re.search(r'country:\s*(\w{2})', output, re.IGNORECASE)
-            if match:
-                country = match.group(1).upper()
-                if country == "RU":
-                    return country
-            
-            # 2. Доп проверки на наличие России в выводе whois
-            russia_patterns = [
-                r'address:\s*.*Russian Federation',
-                r'address:\s*.*Russia\b',
-                r'address:\s*.*Россия',
-                r'address:\s*.*РФ\b',
-            ]
-            for pattern in russia_patterns:
-                if re.search(pattern, output, re.IGNORECASE):
-                    return "RU"
-            if match:
-                return match.group(1).upper()
-            
-            return None
-        except subprocess.TimeoutExpired:
+            m = re.search(r"country:\s*(\w{2})", output, re.IGNORECASE)
+            if m:
+                return m.group(1).upper()
             return None
         except Exception:
             return None
+
+            
+        
+            
+
+            
+
+    
+        
+

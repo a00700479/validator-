@@ -516,7 +516,8 @@ class HostBitsValidator(DataFrameValidator):
                         else:
                             net = ipaddress.IPv6Network(network_str, strict=False)
                         return self._make_error(
-                            f"{network} /{mask_bits} -> Host bits set; canonical: {net.network_address}/{mask_bits}",
+                            f"Указан IP-адрес хоста вместо адреса сети. "
+                            f"Для маски {mask_bits} ожидается: {net.network_address}",
                             self.NETWORK_COLUMN
                         )
                     except:

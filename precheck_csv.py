@@ -218,8 +218,9 @@ def build_fixed_csv(
     data_rows = rows[1:]
 
     # нормализуем заголовки и приводим к длине expected
-    header = [normalized_header_for_fixed(x) for x in header]
-    header16 = (header + [""] * len(expected_cols))[: len(expected_cols)]
+    # header = [normalized_header_for_fixed(x, expected_cols) for x in header]
+    # header16 = (header + [""] * len(expected_cols))[: len(expected_cols)]
+    header16 = expected_cols[:]
 
     # ВАЖНО: чтобы main.py не падал на заголовках — делаем их ровно ожидаемыми
     header16 = expected_cols[:]  # именно так: фиксируем строго
@@ -237,6 +238,29 @@ def build_fixed_csv(
         w.writerows(fixed_rows)
 
     return fixed_path
+
+
+def collapse_ranges(nums: list[int]) -> str:
+    """
+    Превращает [2,3,4,7,8,10] -> '2-4',..
+
+    """
+    if not nums:
+        return ""
+
+    muns = sorted(nums)
+    ranges = []
+    start = prev = nums[0]
+
+    for n in muns[1:]:
+        if n == prev + 1:
+            prev = n
+        else:
+            ranges.append(f"{start}-{prev}" if start != prev else str(start))
+            start = prev = n
+
+    ranges.append(f"{start}-{prev}" if start != prev else str(start))
+    return ", ".join(ranges)
 
 
 # -------------------------------------------------
@@ -448,7 +472,7 @@ def validate_row_rules(row: list[str]) -> list[str]:
     # 5) HTTPS + TCP => SNI/HTTP HOST обязателен
     if url.lower().startswith("https://") and ("tcp" in protocols):
         if is_empty(sni):
-            errs.append("Для https (tcp) обязательно поле 'SNI/HTTP HOST'")
+            errs.append("Для HTTPS (tcp) обязательно поле 'SNI/HTTP HOST'")
 
     # 6) Формат Проверочного IP+Порт (строго)
     parsed_ip, parsed_port = (
@@ -460,6 +484,8 @@ def validate_row_rules(row: list[str]) -> list[str]:
         )
 
     # 7) URL проверки: строго по форме
+    # curl -> URL обязателен и только http(s)
+    # telnet/ping/dig -> URL должен быть пустым( чтобы не было мусора)
 
     if "curl" in methods:
         # для curl URL обязателен и должен быть http(s)
@@ -469,8 +495,10 @@ def validate_row_rules(row: list[str]) -> list[str]:
             errs.append(
                 f"URL проверки при curl должен начинаться с http:// или https:// (получено: '{url}')"
             )
-        if is_empty(dns):
-            errs.append("Указан curl, о не заполнен 'DNS Host'")
+        if is_empty(url):
+            errs.append(
+                "URL проверки должна быть пустая для метода(ов) {methods} (получено: '{url}')"
+            )
     else:
         # для всех остальных методов URL НЕ обязателен
         # но если заполнен - просто проверим, что это похоже на URL
@@ -494,7 +522,7 @@ def run_main_validate(
     project_dir: Path,
     fixed_csv: Path,
     out_csv: Path,
-    skip_whois: bool = True,
+    skip_whois: bool = False,
 ) -> tuple[str, int]:
     """
     Запускает main.py validate и возвращает (stdout + stderr, returncode)
@@ -664,6 +692,30 @@ def build_excel_report(
     wb.save(excel_path)
 
 
+def compress_ranges(nums: list[int]) -> str:
+    """Например [2,3,4,7,8,10] - '2-4', '7-8', 10"""
+    if not nums:
+        return ""
+    nums = sorted(set(nums))
+
+    ranges = []
+    start = prev = nums[0]
+
+    for x in nums[1:]:
+        if x == prev + 1:
+            prev = x
+            continue
+        ranges.append((start, prev))
+        start = prev = x
+
+    ranges.append((start, prev))
+
+    parts = []
+    for a, b in ranges:
+        parts.append(f"{a}-{b}" if a != b else f"{a}")
+        return ", ".join(parts)
+
+
 # -------------------------------------------------
 # ЕДИНАЯ ТОЧКА ВХОДА
 # -------------------------------------------------
@@ -777,6 +829,9 @@ def main():
 
             extra_cols_noted = False
 
+            extra_rows = []  # номера строк, где есть лишние колонки
+            extra_by_amount = {}  # опционально: сколько лишних колонок  -> списки строк
+
             for i, row in enumerate(rows, start=2):  # start=2 потому что 1- заголовок
                 # пропускаем полностью пустые строки
                 if all((c or "").strip() == "" for c in row):
@@ -801,23 +856,14 @@ def main():
                     row16 = row + [""] * (len(COLUMN_NAMES) - len(row))
 
                 elif len(row) > len(COLUMN_NAMES):
-                    row_has_problem = True
-                    if not extra_cols_noted:
-                        rs.print_startup_warning(
-                            f"Обнаружены лишние колонки в строках (пример: строка {i}: + {len(row) - len(COLUMN_NAMES)}). "
-                            "Лишнее игнорируется"
-                        )
-                        add_group(
-                            counts,
-                            examples,
-                            f"Строки: лишние колонки (больше {len(COLUMN_NAMES)})",
-                            i,
-                        )
+                    extra = len(row) - len(COLUMN_NAMES)
+
+                    extra_rows.append(i)
+
+                    # опционально: группировка по величине лишних колонок
+                    extra_by_amount.setdefault(extra, []).append(i)
 
                     row16 = row[: len(COLUMN_NAMES)]
-
-                else:
-                    row16 = row
 
                 # 2) логические правила заполнения
                 errs = validate_row_rules(row16)
@@ -829,6 +875,13 @@ def main():
                 # 3) финально считаем строку "битой"
                 if row_has_problem:
                     bad += 1
+
+            if extra_rows:
+                rs.print_startup_warning("Лишние колонки (лишние '|') обнаружены:")
+                for extra, rows_list in sorted(extra_by_amount.items()):
+                    rs.print_startup_warning(
+                        f"   +{extra}: строки {compress_ranges(rows_list)}"
+                    )
 
             rs.print_startup_warning(f"Итого строк данных: {total}")
             rs.print_startup_warning(f"Строк с ошибками: {bad}")
@@ -851,11 +904,11 @@ def main():
                     f"Создан FIXED CSV для main.py:  {fixed_csv.name}"
                 )
 
-                main_log, rc = run_main_py_validate(
+                main_log, rc = run_main_validate(
                     project_dir=Path(__file__).parent,  # папка, где лежит main.py
                     fixed_csv=fixed_csv,
                     out_csv=main_out_csv,
-                    skip_whois=True,
+                    skip_whois=False,
                 )
 
                 # пишем отдельный лог main.py
@@ -885,7 +938,7 @@ def main():
                         precheck_txt=precheck_report_path,
                         main_log_txt=main_log_txt,
                     )
-                    rs.print_row_errors(f"Excel-отчет: {main_excel.name}")
+                    rs.print_startup_warning(f"Excel-отчет: {main_excel.name}")
                 except Exception as e:
                     rs.print_error(f"Не удалось соборать Excel-отчет: {e}")
 
