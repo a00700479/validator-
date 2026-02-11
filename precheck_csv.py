@@ -1,29 +1,19 @@
-# ===============================
-# PRECHECK: предварительная проверка CSV
-# ================================
-# Назначение:
-#   1) Собрать ВСЕ ошибки формата (кодировка, разделитель, заголовки)
-#   2) Собрать ошибки заполнения (пустые обязательные поля) и базовую логику методов проверки
-#   3) Если возможно БЕЗ двусмысленности — запустить основной валидатор (main.py validate) на временной копии
-#
-# Важно:
-#   - Исходный CSV НЕ изменяется
-#   - Отчёты сохраняются в папку reports рядом с входными файлами (или в указанную --reports-dir)
-#   - main.py запускать вручную больше не нужно — этот скрипт сам вызовет его "под капотом"
-# ==============================
-
 import argparse
 import csv
 import os
 import re
 import subprocess
 import sys
+import itertools
 import tempfile
+import ipaddress
+import io
 from dataclasses import dataclass
 from pathlib import Path
 import pandas as pd
 from openpyxl import load_workbook
 from collections import defaultdict
+from typing import Iterator
 
 from services.report_service import ReportService
 from config.columns import (
@@ -33,8 +23,14 @@ from config.columns import (
     VALID_CHECK_METHODS,
 )
 
+print("=== PRECHECK STARTED ===", flush=True)
+
+BASE_DIR = Path(__file__).resolve().parent
+
 # Какие разделители пытаемся распознать
 DELIMS = ["|", ";", ",", "\t"]
+
+MASK_RE = re.compile(r"/\s*(\d{1,3})")
 
 
 # ----------------------------
@@ -49,11 +45,25 @@ def detect_encoding_and_text(path: Path) -> tuple[str, str]:
     """
     raw = path.read_bytes()
 
+    # --- 1) ЯВНЫЙ  BOM (самое важное) ---
+    if raw.startswith(b"\xff\xfe"):
+        return "utf-16-le", raw.decode("utf-16-le", errors="replace")
+    if raw.startswith(b"\xfe\xff"):
+        return "utf-16-be", raw.decode("utf-16-be", errors="replace")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return "utf-8", raw.decode("utf-8-sig", errors="replace")
+
     # Сначала пробуем норму по ТЗ: UTF-8
-    for enc in ("utf-8-sig", "utf-8"):
+    for enc in ("utf-8",):
         try:
             return enc, raw.decode(enc)
         except UnicodeDecodeError:
+            pass
+    # Дополнимтельно
+    for enc in ("utf-16",):
+        try:
+            return enc, raw.decode(enc, errors="replace")
+        except Exception:
             pass
     # Фолбэки (в реальности часто встречаются)
     for enc in ("cp1251", "cp866", "latin-1"):
@@ -88,18 +98,19 @@ def split_header(header_line: str, delim: str) -> list[str]:
     return [h.strip().replace("\ufeff", "") for h in header_line.rstrip().split(delim)]
 
 
-def parse_rows(text: str, delim: str) -> tuple[list[list[str]], list[str]]:
+def parse_rows_iter(text: str, delim: str) -> tuple[Iterator[list[str]], list[str]]:
     """
-    Разбираем CSV в строки.
+    Потоковый разбор CSV:
+    - header: список колонок
+    - rows_iter: итератор по строкам данных (без list(reader))
     """
-    lines = text.splitlines()
-    if not lines:
-        return [], []
+    f = io.StringIO(text)
+    reader = csv.reader(f, delimiter=delim)
 
-    header = split_header(lines[0], delim)
-    reader = csv.reader(lines, delimiter=delim)
-    rows = list(reader)
-    return rows[1:], header
+    header_row = next(reader, [])
+    header = [c.strip() for c in header_row] if header_row else []
+
+    return reader, header
 
 
 # -------------------------------------------------
@@ -187,6 +198,53 @@ def normalized_header_for_fixed(
     return expected[:], []
 
 
+QUOTE_CHARS = "'\"`’‘“”«»"
+
+
+def norm_mask(mask: str) -> str:
+    m = (mask or "").replace("\ufeff", "").strip()
+    # убираем внешние кавычки, апострофы
+    m = m.strip(QUOTE_CHARS).strip()
+    m = m.replace("/", "/").replace("/", "/").replace("⁄", "/")
+    return m
+
+
+def parse_mask_prefix(mask: str) -> int | None:
+    m = norm_mask(mask)
+    mm = MASK_RE.search(m)
+    if not mm:
+        return None
+    try:
+        return int(mm.group(1))
+    except ValueError:
+        return None
+
+
+def parse_ip_from_ipport(value: str) -> str | None:
+    s = (value or "").strip()
+    if not s:
+        return None
+
+    # [IPv6]:port
+    m = re.match(r"^\[([0-9a-fA-F:]+)\]:(\d{1,5})$", s)
+    if m:
+        return m.group(1)
+
+    # IPv4:port
+    m = re.match(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$", s)
+    if m:
+        return m.group(1)
+
+    # IPv6:port
+    # # 2a00....:443
+    if ":" in s:
+        left, sep, right = s.rpartition(":")
+        if sep and right.isdigit():
+            return left
+
+    return None
+
+
 def build_fixed_csv(
     csv_file: Path,
     text: str,
@@ -238,29 +296,6 @@ def build_fixed_csv(
         w.writerows(fixed_rows)
 
     return fixed_path
-
-
-def collapse_ranges(nums: list[int]) -> str:
-    """
-    Превращает [2,3,4,7,8,10] -> '2-4',..
-
-    """
-    if not nums:
-        return ""
-
-    muns = sorted(nums)
-    ranges = []
-    start = prev = nums[0]
-
-    for n in muns[1:]:
-        if n == prev + 1:
-            prev = n
-        else:
-            ranges.append(f"{start}-{prev}" if start != prev else str(start))
-            start = prev = n
-
-    ranges.append(f"{start}-{prev}" if start != prev else str(start))
-    return ", ".join(ranges)
 
 
 # -------------------------------------------------
@@ -410,6 +445,8 @@ def validate_row_rules(row: list[str]) -> list[str]:
     IDX_CHECK_IPPORT = 12
     IDX_URL = 13
     IDX_METHOD = 14
+    IDX_NETWORK = 5
+    IDX_MASK = 6
 
     port = cell(row, IDX_PORT)
     protocol_raw = cell(row, IDX_PROTOCOL)
@@ -418,6 +455,8 @@ def validate_row_rules(row: list[str]) -> list[str]:
     check_ipport = cell(row, IDX_CHECK_IPPORT)
     url = cell(row, IDX_URL)
     method_raw = cell(row, IDX_METHOD)
+    network_id = cell(row, IDX_NETWORK)
+    mask = cell(row, IDX_MASK)
 
     # 1) Пустые обязательные ячейки (по REQUIRED_COLUMNS из config.colomns)
     for col in REQUIRED_COLUMNS:
@@ -483,6 +522,46 @@ def validate_row_rules(row: list[str]) -> list[str]:
             "Проверочный IP+Порт должен быть в формате IPv4:Port, например 1.2.3.4: 443"
         )
 
+    # 6.1) Проверка: IP из "Проверочный IP+Порт" принадлежит сети network_id/mask
+
+    # MASK
+    # if not is_empty(mask):
+    #    p = parse_mask_prefix(mask)
+    #    if p is None:
+    #        errs.append(f"MASK: неверный формат (ожидается '/число'): '{mask!r}'")
+
+    # NETWORK
+    if not is_empty(network_id) and not is_empty(mask) and not is_empty(check_ipport):
+        ip_str = parse_ip_from_ipport(check_ipport)
+        if ip_str is None:
+            errs.append(
+                f"Проверочный IP+Порт: неверный формат (ожидается ip:port): '{check_ipport}'"
+            )
+        else:
+            prefix = parse_mask_prefix(mask)
+            if prefix is None:
+                errs.append(f"MASK: неверный формат (ожидается '/число'): '{mask!r}'")
+            else:
+                try:
+                    ip_obj = ipaddress.ip_address(ip_str)
+                    net_obj = ipaddress.ip_network(
+                        f"{network_id}/{prefix}", strict=False
+                    )
+
+                    # контроль версии: v4/v6 должны совпадать
+                    if ip_obj.version != net_obj.version:
+                        errs.append(
+                            f"Несовпадение IPv4/IPv6: сеть '{network_id}{mask}', проверочный IP '{ip_str}'"
+                        )
+                    elif ip_obj not in net_obj:
+                        errs.append(
+                            f"Проверочный IP '{ip_str}' не принадлежит сети '{net_obj}'"
+                        )
+                except ValueError:
+                    errs.append(
+                        f"Сеть.MASK: некорректные значения: network='{network_id}', mask='{mask}'"
+                    )
+
     # 7) URL проверки: строго по форме
     # curl -> URL обязателен и только http(s)
     # telnet/ping/dig -> URL должен быть пустым( чтобы не было мусора)
@@ -526,34 +605,44 @@ def run_main_validate(
 ) -> tuple[str, int]:
     """
     Запускает main.py validate и возвращает (stdout + stderr, returncode)
+    При этом печатает вывод main в консоль вживую
     """
     cmd = [
         sys.executable,
         str(project_dir / "main.py"),
         "validate",
-        "--input",
-        str(fixed_csv),
-        "--output",
-        str(out_csv),
+        "--input", str(fixed_csv),
+        "--output", str(out_csv),
+        "--max-errors", "10000",
     ]
     if skip_whois:
         cmd.append("--skip-whois")
 
-    env = dict(**dict(os.environ))
+    env = dict(os.environ)
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
 
-    p = subprocess.run(
+    p = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
         errors="replace",
         env=env,
         cwd=str(project_dir),  # важно: main.py любит запуск из своей папки
+        bufsize=1,
     )
-    return (p.stdout or "") + (p.stderr or ""), p.returncode
 
+    out_lines = []
+    assert p.stdout is not None
+    for line in p.stdout:
+        out_lines.append(line)
+        print(line, end="", flush=True)
+
+    rc = p.wait()    
+    return "".join(out_lines), rc
 
 def write_text(path: Path, text: str):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -618,17 +707,17 @@ class FileOutcome:
     ran_validator: bool
 
 
-MAX_EXAMPLES_PER_TYPE = 15
+MAX_EXAMPLES_PER_TYPE = 10000
 
 
-def add_group(counts: dict, examples: dict, key: str, line_no: int | None = None):
+def add_group(counts: dict, rows_all: dict, key: str, line_no: int | None = None):
     """Увеличивает счетчик ошибок и сохраняет номера строк-примеров"""
     counts[key] += 1
-    if line_no is not None and len(examples[key]) < MAX_EXAMPLES_PER_TYPE:
-        examples[key].append(line_no)
+    if line_no is not None:
+        rows_all[key].append(line_no)
 
 
-def dump_groups(rs, title: str, counts: dict, examples: dict):
+def dump_groups(rs, title: str, counts: dict, rows_all: dict):
     """Печатает сгруппированные ошибки по убыванию частоты"""
     if not counts:
         rs.print_startup_warning(f"{title}: нет")
@@ -638,12 +727,10 @@ def dump_groups(rs, title: str, counts: dict, examples: dict):
 
     # сортируем по количеству (самые частые сверху)
     for msg, cnt in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
-        ex = examples.get(msg, [])
-        ex_str = ", ".join(str(x) for x in ex)
-        tail = " ..." if cnt > len(ex) else ""
-        if ex_str:
+        all_rows = sorted(set(rows_all.get(msg, [])))
+        if all_rows:
             rs.print_startup_warning(
-                f"• ({cnt} шт.) {msg}\n Примеры строк: {ex_str}{tail}"
+                f"• ({cnt} шт.) {msg}\n Строки: {compress_ranges(all_rows)}"
             )
         else:
             rs.print_startup_warning(f"• ({cnt} шт.) {msg}")
@@ -696,24 +783,149 @@ def compress_ranges(nums: list[int]) -> str:
     """Например [2,3,4,7,8,10] - '2-4', '7-8', 10"""
     if not nums:
         return ""
-    nums = sorted(set(nums))
 
+    nums = sorted(set(nums))
     ranges = []
     start = prev = nums[0]
 
     for x in nums[1:]:
         if x == prev + 1:
             prev = x
-            continue
-        ranges.append((start, prev))
-        start = prev = x
+        else:
+            ranges.append((start, prev))
+            start = prev = x
 
     ranges.append((start, prev))
 
     parts = []
     for a, b in ranges:
         parts.append(f"{a}-{b}" if a != b else f"{a}")
-        return ", ".join(parts)
+
+    return ", ".join(parts)
+
+
+def _clean_main_log_for_report(text: str) -> str:
+    """
+    Чистим main.txt для общего отчета:
+    - убираем tqdm/прогресс бары
+    - выкидываем REQUIRED (они уже есть в precheck)
+    """
+    if not text:
+        return ""
+
+    out_lines = []
+    for line in text.splitlines():
+        s = line.rstrip("\n")
+
+        # 1) выкидываем прогресс бары и мусор
+        if s.startswith("Валидация:"):
+            continue
+        if "Whois/RDAP запросы" in s:
+            continue
+        if re.search(r"\|\s*\d+/\d+\s*\[", s):  # что то вроде | 9/104 [00:06...]
+            continue
+        if s in ("[A", ""):
+            continue
+
+        # 2) выкидываем REQUIRED из main
+        if "[REQUIRED]" in s:
+            continue
+
+        out_lines.append(line)
+
+        # дополнительно: схлопнем много пустых строк подряд до одной
+    cleaned = "\n".join(out_lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
+def build_final_report(precheck_path: Path, main_path: Path, final_path: Path) -> None:
+    """
+    Склеиваем 2 отчета в 1 общий
+    - precheck кладем целиком
+    - main чистим от REQUIRED и от прогресс бара
+    """
+    pre_text = (
+        precheck_path.read_text(encoding="utf-8", errors="replace")
+        if precheck_path.exists()
+        else ""
+    )
+    main_text_raw = (
+        main_path.read_text(encoding="utf-8", errors="replace")
+        if main_path.exists()
+        else ""
+    )
+    main_text = _clean_main_log_for_report(main_text_raw)
+
+    final = []
+    final.append("==== PRECHECK ====\n")
+    final.append(pre_text.strip() + "\n")
+
+    final.append("\n==== MAIN ====\n")
+    final.append(
+        (main_text.strip() + "\n")
+        if main_text.strip()
+        else "(main.txt не найден или пуст)\n"
+    )
+
+    final_path.write_text("".join(final), encoding="utf-8")
+
+
+def parse_main_errors(main_text: str) -> list[tuple[str, str]]:
+    """
+    Парсим ошибки из MAIN.txt.
+    Возвращаем список пар (код_ошибки, текст).
+    Пример:
+      ("REQUIRED", "Пустое обязательное поле: 'CDN Yes/No'")
+    """
+    pairs = []
+
+    for line in main_text.splitlines():
+        line = line.strip()
+        if not line.startswith("[❌]"):
+            continue
+
+        # [❌] Number 123: [REQUIRED] CDN Yes/No: Обязательное поле не заполнено
+        m = re.search(r"\[(\w+)\]\s+(.*)", line)
+        if not m:
+            continue
+
+        code = m.group(1)
+        text = m.group(2)
+        pairs.append((code, text))
+
+    return pairs
+
+
+def group_main_errors(pairs: list[tuple[str, str]]) -> dict[str, list[str]]:
+    """
+    Группируем ошибки MAIN по тексту.
+    Возвращает:
+      {
+        "CDN Yes/No: Обязательное поле не заполнено": ["REQUIRED", "REQUIRED", ...]
+      }
+    """
+    groups = defaultdict(list)
+
+    for code, text in pairs:
+        groups[text].append(code)
+
+    return groups
+
+
+def format_grouped_main(groups: dict[str, list[str]]) -> str:
+    """
+    Форматируем сгруппированные ошибки MAIN для отчёта.
+    """
+    if not groups:
+        return "Ошибок MAIN не обнаружено. \n"
+
+    lines = []
+    for text, codes in groups.items():
+        count = len(codes)
+        lines.append(f"• ({count} шт.) {text}")
+
+    return "\n".join(lines)
 
 
 # -------------------------------------------------
@@ -722,6 +934,7 @@ def compress_ranges(nums: list[int]) -> str:
 
 
 def main():
+    print("=== MAIN ENTERED ===", flush=True)
     parser = argparse.ArgumentParser(
         description="Precheck CSV + сбор всех ошибок в отчет"
     )
@@ -744,85 +957,97 @@ def main():
 
     files = [inp] if inp.is_file() else csv_file
 
-    report_dir = Path(r"C:\Users\user\Documents\White list\reports")
-    report_dir.mkdir(parents=True, exist_ok=True)
+    reports_all_dir = BASE_DIR / "reports_all"
+    reports_all_dir.mkdir(parents=True, exist_ok=True)
+
+    report_only_dir = BASE_DIR / "report_only"
+    report_only_dir.mkdir(parents=True, exist_ok=True)
 
     for csv_file in files:
 
         # Группировка всех проблем
         counts = defaultdict(int)  # текст проблемы -> сколько раз
-        examples = defaultdict(
-            list
-        )  # текст проблемы -> список строк-примеров (до лимита)
+        rows_all = defaultdict(list)  # ВСЕ номера строк
 
-        precheck_report_path = report_dir / f"{csv_file.stem}_PRECHECK.txt"
+        precheck_report_path = reports_all_dir / f"{csv_file.stem}_PRECHECK.txt"
 
         # 1) читаем файл как текст
+        print("1) before detect_encoding", flush=True)
         enc, text = detect_encoding_and_text(csv_file)
+        print(f"2) after detect_encoding: {enc}, bytes={len(text)} chars", flush=True)
 
         # 2) открываем отчет и записываем грамотно
         with open(precheck_report_path, "w", encoding="utf-8-sig") as f:
             rs = ReportService(output=f)
 
             rs.print_startup_warning(f"Проверка файла: {csv_file.name}")
-            if enc.lower().startswith("utf-8"):
+
+            enc_norm = enc.lower()
+
+            if enc_norm.startswith("utf-8"):
                 rs.print_startup_warning("Кодировка: UTF-8")
             else:
                 rs.print_startup_warning(f"Кодировка: {enc}")
+                rs.print_startup_warning("ВНИМАНИЕ: файл CSV сохранен не в UTF-8. ")
 
             lines = text.splitlines()
+            print(f"3) after splitlines: lines={len(lines)}", flush=True)
             if not lines:
                 rs.print_error("Файл пустой")
                 continue
 
             header_line = lines[0] if lines else ""
+            print(f"4) header sample: {header_line[:80]!r}", flush=True)
 
             # по ТЗ разделитель строго |
 
-            delim = "|"
-            if "|" not in header_line:
+            if "|" in header_line:
+                delim = "|"
+            elif "¦" in header_line:
+                delim = "¦"
+                rs.print_startup_warning(
+                    "Обнаружен нестандартный разделитель '¦' (Excel)."
+                )
+            elif "│" in header_line:
+                delim = "│"
+                rs.print_startup_warning("Обнаружен нестандартный разделитель '│'.")
+            else:
                 rs.print_error(
                     "Не найден разделитель '|'. Файл должен быть сохранен как CSV с разделителем |"
                 )
-                continue
+                delim = "|"
 
             # 3) Парсим CSV
-            rows, header = parse_rows(text, delim)
+            rows, header = parse_rows_iter(text, delim)
+            print(f"5) after parse_rows_iter: header_cols={len(header)}", flush=True)
 
             # Сколько колонок реально в файле
             rs.print_startup_warning(
                 f"Колонок в файле: {len(header)} (по Инструкции должно быть {len(COLUMN_NAMES)})"
             )
 
-            extra = len(header) - len(COLUMN_NAMES)
-            if extra > 0:
-                add_group(counts, examples, f"Файл содержит лишние колонки: +{extra}")
-            elif extra < 0:
-                add_group(
-                    counts,
-                    examples,
-                    f"Файл содержит меньше колонок: {len(header)} вместо {len(COLUMN_NAMES)}",
-                )
-
-            # 4) заголовки (НЕ останавливаемся, просто фиксируем)
-
             mism = compare_headers_strict(header[: len(COLUMN_NAMES)], COLUMN_NAMES)
             if mism:
                 # одну запись "тип проблемы" + детали отдельными пунктами
-                add_group(counts, examples, "Несовпадение в написании заголовков")
+                rs.print_startup_warning(
+                    "Заголовки: есть расхождения (регистр/написание):"
+                )
                 for col_no, expected, got in mism:
-                    add_group(
-                        counts,
-                        examples,
-                        f"Заголовок: колонка {col_no}: ожидается '{expected}', получено '{got}'",
+                    rs.print_startup_warning(
+                        f"  - Колонка {col_no}: '{got}' -> должно быть '{expected}'"
                     )
             else:
                 rs.print_startup_warning("Заголовки: ОК")
 
             # 5) Проверяем строки и собираем ВСЕ ошибки
-            if not rows:
+
+            first_row = next(rows, None)
+            if first_row is None:
                 rs.print_error("В файле нет строк данных (только заголовок)")
                 continue
+
+            # вернем первую строку обратно в поток
+            rows = itertools.chain([first_row], rows)
 
             total = 0
             bad = 0
@@ -831,6 +1056,8 @@ def main():
 
             extra_rows = []  # номера строк, где есть лишние колонки
             extra_by_amount = {}  # опционально: сколько лишних колонок  -> списки строк
+
+            print("6) before row loop", flush=True)
 
             for i, row in enumerate(rows, start=2):  # start=2 потому что 1- заголовок
                 # пропускаем полностью пустые строки
@@ -849,7 +1076,7 @@ def main():
                     )
                     add_group(
                         counts,
-                        examples,
+                        rows_all,
                         f"Строки: не хватает колонок (меньше {len(COLUMN_NAMES)})",
                         i,
                     )
@@ -864,13 +1091,15 @@ def main():
                     extra_by_amount.setdefault(extra, []).append(i)
 
                     row16 = row[: len(COLUMN_NAMES)]
+                else:
+                    row16 = row
 
                 # 2) логические правила заполнения
                 errs = validate_row_rules(row16)
                 if errs:
                     row_has_problem = True
                     for e in errs:
-                        add_group(counts, examples, e, i)
+                        add_group(counts, rows_all, e, i)
 
                 # 3) финально считаем строку "битой"
                 if row_has_problem:
@@ -879,20 +1108,29 @@ def main():
             if extra_rows:
                 rs.print_startup_warning("Лишние колонки (лишние '|') обнаружены:")
                 for extra, rows_list in sorted(extra_by_amount.items()):
+                    ranges = compress_ranges(rows_list)
                     rs.print_startup_warning(
-                        f"   +{extra}: строки {compress_ranges(rows_list)}"
+                        f"   +{extra}: строки {ranges} (всего {len(rows_list)})"
                     )
 
+            print("7) after row loop", flush=True)        
+
             rs.print_startup_warning(f"Итого строк данных: {total}")
-            rs.print_startup_warning(f"Строк с ошибками: {bad}")
+            # rs.print_startup_warning(f"Строк с ошибками: {bad}")
 
             # 6) Готовим FIXED CSV и запускаем main.py
 
-            fixed_dir = report_dir / "_temp"
-            main_out_csv = report_dir / f"{csv_file.stem}_MAIN_result.csv"
-            main_log_txt = report_dir / f"{csv_file.stem}_MAIN.txt"
+           
+
+            fixed_dir = reports_all_dir / "_temp"
+            main_out_csv = reports_all_dir / f"{csv_file.stem}_MAIN_result.csv"
+            main_log_txt = reports_all_dir / f"{csv_file.stem}_MAIN.txt"
+
+            main_log = ""
+            rc = 999  # любое неуспешно по умолчанию
 
             try:
+                print("8) before build_fixed_csv", flush=True)
                 fixed_csv = build_fixed_csv(
                     csv_file=csv_file,
                     text=text,
@@ -900,9 +1138,10 @@ def main():
                     expected_cols=COLUMN_NAMES,  # 16 наших ожидаемых
                     out_dir=fixed_dir,
                 )
-                rs.print_startup_warning(
-                    f"Создан FIXED CSV для main.py:  {fixed_csv.name}"
-                )
+
+                print("9) after build_fixed_csv", flush=True)
+
+                print("10) before run_main_validate", flush=True)
 
                 main_log, rc = run_main_validate(
                     project_dir=Path(__file__).parent,  # папка, где лежит main.py
@@ -910,41 +1149,29 @@ def main():
                     out_csv=main_out_csv,
                     skip_whois=False,
                 )
-
-                # пишем отдельный лог main.py
-                main_log_txt.write_text(main_log, encoding="utf-8")
-
-                if rc == 0:
-                    rs.print_startup_warning(f"main.py: OK. Результат: {main_out_csv}")
-                    rs.print_startup_warning(f"Лог main.py: {main_log_txt}")
-                else:
-                    rs.print_error(
-                        f"main.py завершился с кодом {rc}. Cм. лог: {main_log_txt.name}"
-                    )
+                print(f"11) after run_main_validate rc={rc}", flush=True)
 
             except Exception as e:
+                main_log = f"EXCEPTION: {e}"
+                rc = 1
                 rs.print_error(
                     f"Не удалось подготовить FIXED CSV / запустить main.py: {e}"
                 )
 
-            main_excel = report_dir / f"{csv_file.stem}_REPORT.xlsx"
+                                  
+            # ВСЕГДА пишем лог main.py
+            main_log_txt.write_text(main_log, encoding="utf-8", errors="replace")
 
-            if main_out_csv.exists():
-                try:
-                    build_excel_report(
-                        main_csv=main_out_csv,
-                        excel_path=main_excel,
-                        sep="|",  #  у нас разделитель по форме
-                        precheck_txt=precheck_report_path,
-                        main_log_txt=main_log_txt,
-                    )
-                    rs.print_startup_warning(f"Excel-отчет: {main_excel.name}")
-                except Exception as e:
-                    rs.print_error(f"Не удалось соборать Excel-отчет: {e}")
-
-            dump_groups(rs, "Сводка проблем (сгруппировано)", counts, examples)
+            # Итоговая сводка по PRECHECK
+            dump_groups(rs, "Сводка проблем (сгруппировано)", counts, rows_all)
 
         print("Отчет сохранен:", precheck_report_path)
+
+        # ✅ ВАЖНО: общий отчёт делаем ЗДЕСЬ, ПОСЛЕ try/except — всегда
+
+        final_report_path = report_only_dir / f"{csv_file.stem}_REPORT.txt"
+        build_final_report(precheck_report_path, main_log_txt, final_report_path)
+        print(f"Общий отчет сохранен:", final_report_path.name)
 
     print("Предварительная проверка завершена")
 

@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+build/
+dist/
+
+reports_all/
+report_only/
+*.zip
+
+*.xlsx
+*.csv
+*.spec
