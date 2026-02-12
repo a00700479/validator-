@@ -46,25 +46,18 @@ def detect_encoding_and_text(path: Path) -> tuple[str, str]:
     raw = path.read_bytes()
 
     # --- 1) ЯВНЫЙ  BOM (самое важное) ---
-    if raw.startswith(b"\xff\xfe"):
-        return "utf-16-le", raw.decode("utf-16-le", errors="replace")
-    if raw.startswith(b"\xfe\xff"):
-        return "utf-16-be", raw.decode("utf-16-be", errors="replace")
     if raw.startswith(b"\xef\xbb\xbf"):
-        return "utf-8", raw.decode("utf-8-sig", errors="replace")
+        return "utf-8-sig", raw.decode("utf-8-sig", errors="replace")
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        # UTF-16 c BOM (LE/BE Python сам разрулит)
+        return "utf-16", raw.decode("utf-16", errors="replace")
 
     # Сначала пробуем норму по ТЗ: UTF-8
-    for enc in ("utf-8",):
-        try:
-            return enc, raw.decode(enc)
-        except UnicodeDecodeError:
-            pass
-    # Дополнимтельно
-    for enc in ("utf-16",):
-        try:
-            return enc, raw.decode(enc, errors="replace")
-        except Exception:
-            pass
+    try:
+        return "utf-8", raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+
     # Фолбэки (в реальности часто встречаются)
     for enc in ("cp1251", "cp866", "latin-1"):
         try:
@@ -220,27 +213,47 @@ def parse_mask_prefix(mask: str) -> int | None:
         return None
 
 
-def parse_ip_from_ipport(value: str) -> str | None:
-    s = (value or "").strip()
+def parse_ip_from_ipport(value: str, allow_no_port: bool) -> str | None:
+    """
+    Возвращает IP из:
+      - '1.2.3.4:443'
+      - '1.2.3.4' (если allow_no_port=True)
+      - '[2001:db8::1]:443'
+      - '2001:db8::1' (если allow_no_port=True)
+    """
+    if value is None:
+        return None
+
+    s = str(value).replace("\ufeff", "").strip().strip('"').strip("'")
     if not s:
         return None
 
     # [IPv6]:port
-    m = re.match(r"^\[([0-9a-fA-F:]+)\]:(\d{1,5})$", s)
+    m = re.match(r"^\[([0-9a-fA-F:]+)\](?::(\d+))?$", s)
     if m:
-        return m.group(1)
+        ip = m.group(1)
+        port = m.group(2)
+        if port is None and not allow_no_port:
+            return None
+        return ip
 
-    # IPv4:port
-    m = re.match(r"^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$", s)
+    # IPv4(:port)?
+    m = re.match(r"^(\d+\.\d+\.\d+\.\d+)(?::(\d+))?$", s)
     if m:
-        return m.group(1)
+        ip = m.group(1)
+        port = m.group(2)
+        if port is None and not allow_no_port:
+            return None
+        return ip
 
-    # IPv6:port
+    # IPv6 без скобок (порт без скобок не поддерживаем - это неоднозначно)
     # # 2a00....:443
     if ":" in s:
-        left, sep, right = s.rpartition(":")
-        if sep and right.isdigit():
-            return left
+        try:
+            ipaddress.ip_address(s)
+            return s if allow_no_port else None
+        except Exception:
+            return None
 
     return None
 
@@ -489,82 +502,81 @@ def validate_row_rules(row: list[str]) -> list[str]:
     # 4) Правила по методам из таблицы Word
 
     if "telnet" in methods:
-        # - telnet: обязателен Проверочный IP+Порт; URL обычно пуст
+        # - telnet требует IP: (даже если есть ping - telnet все равно нужен порт)
         if is_empty(check_ipport):
-            # строгий режим: порт в IP+Port должен совпадать с колонкой Port
-            if is_empty(check_ipport):
-                errs.append("Указан telnet, но ячейка 'Проверочный IP+Порт' пустая")
+            errs.append("Указан telnet, но ячейка 'Проверочный IP+Порт' пустая")
+        else:
+            ip_str = parse_ip_from_ipport(check_ipport, allow_no_port=False)
+            if ip_str is None:
+                errs.append("Проверочный IP+Порт: для telnet ожидается ip:port")
             # URL не нужен, но не считаем ошибкой, если заполнен
 
     if "ping" in methods:
-        # - ping: нужен IP (берем из Проверочный IP+Порт)
+        # - ping может работать либо по IP(берем из Проверочный IP+Порт), либо по DNS Host
         if is_empty(check_ipport) and is_empty(dns):
-            errs.append("Указан ping, но нет ни IP, ни DNS для проверки")
+            errs.append(
+                "Указан ping, но нет ни IP (Проверочный IP+Порт), ни DNS Host для проверки"
+            )
 
     if "dig" in methods:
         # - dig: нужен DNS Host (или SNI/HTTP HOST), URL не нужен
         if is_empty(dns) and is_empty(sni):
             errs.append(
-                "Указан dig, но ячейки 'DNS Host' и 'SNI/HTTP HOST' пустые (нужно имя для проверки)"
+                "Указан dig, но ячейки 'DNS Host' и 'SNI/HTTP HOST' пустые (нужно имя для DNS-проверки)"
             )
 
     # 5) HTTPS + TCP => SNI/HTTP HOST обязателен
-    if url.lower().startswith("https://") and ("tcp" in protocols):
+    url_l = (url or "").strip().lower()
+    if url_l.startswith("https://") and ("tcp" in protocols):
         if is_empty(sni):
             errs.append("Для HTTPS (tcp) обязательно поле 'SNI/HTTP HOST'")
 
-    # 6) Формат Проверочного IP+Порт (строго)
-    parsed_ip, parsed_port = (
-        _parse_ip_port(check_ipport) if not is_empty(check_ipport) else (None, None)
-    )
-    if not is_empty(check_ipport) and parsed_ip is None:
-        errs.append(
-            "Проверочный IP+Порт должен быть в формате IPv4:Port, например 1.2.3.4: 443"
-        )
+    # 6.1) Проверка: IP из "Проверочный IP+Порт" + принадлежность сети network_id/mask
 
-    # 6.1) Проверка: IP из "Проверочный IP+Порт" принадлежит сети network_id/mask
-
-    # MASK
-    # if not is_empty(mask):
-    #    p = parse_mask_prefix(mask)
-    #    if p is None:
-    #        errs.append(f"MASK: неверный формат (ожидается '/число'): '{mask!r}'")
-
-    # NETWORK
-    if not is_empty(network_id) and not is_empty(mask) and not is_empty(check_ipport):
-        ip_str = parse_ip_from_ipport(check_ipport)
+    allow_ip_without_port = ("ping" in methods) and ("telnet" not in methods)
+    # Если поле пустое:
+    if is_empty(check_ipport):
+        # Пусто допустимо только если есть ping (telnet без порта не  допускаем)
+        if "ping" not in methods:
+            errs.append("Проверочный IP+Порт: обязательное поле (нужно ip:port)")
+    else:
+        ip_str = parse_ip_from_ipport(check_ipport, allow_no_port=allow_ip_without_port)
         if ip_str is None:
-            errs.append(
-                f"Проверочный IP+Порт: неверный формат (ожидается ip:port): '{check_ipport}'"
-            )
-        else:
-            prefix = parse_mask_prefix(mask)
-            if prefix is None:
-                errs.append(f"MASK: неверный формат (ожидается '/число'): '{mask!r}'")
+            if allow_ip_without_port:
+                errs.append(
+                    "Проверочный IP+Порт: ожидается ip или ip:port (для ping можно без порта)"
+                )
             else:
-                try:
-                    ip_obj = ipaddress.ip_address(ip_str)
-                    net_obj = ipaddress.ip_network(
-                        f"{network_id}/{prefix}", strict=False
-                    )
+                errs.append("Проверочный IP+Порт: неверный формат (ожидается ip:port)")
+        else:
+            # проверка принадлежности сети - только если сеть и маска заданы
+            if not is_empty(network_id) and not is_empty(mask):
 
-                    # контроль версии: v4/v6 должны совпадать
-                    if ip_obj.version != net_obj.version:
-                        errs.append(
-                            f"Несовпадение IPv4/IPv6: сеть '{network_id}{mask}', проверочный IP '{ip_str}'"
+                prefix = parse_mask_prefix(mask)
+                if prefix is None:
+                    errs.append(f"MASK: неверный формат (ожидается '/число'): {mask!r}")
+                else:
+                    try:
+                        ip_obj = ipaddress.ip_address(ip_str)
+                        net_obj = ipaddress.ip_network(
+                            f"{network_id}/{prefix}", strict=False
                         )
-                    elif ip_obj not in net_obj:
+
+                        # контроль версии: v4/v6 должны совпадать
+                        if ip_obj.version != net_obj.version:
+                            errs.append(
+                                f"Несовпадение IPv4/IPv6: сеть '{network_id}{mask}', проверочный IP '{ip_str}'"
+                            )
+                        elif ip_obj not in net_obj:
+                            errs.append(
+                                f"Проверочный IP '{ip_str}' не принадлежит сети '{net_obj}'"
+                            )
+                    except ValueError:
                         errs.append(
-                            f"Проверочный IP '{ip_str}' не принадлежит сети '{net_obj}'"
+                            f"Сеть.MASK: некорректные значения: network='{network_id}', mask='{mask}'"
                         )
-                except ValueError:
-                    errs.append(
-                        f"Сеть.MASK: некорректные значения: network='{network_id}', mask='{mask}'"
-                    )
 
     # 7) URL проверки: строго по форме
-    # curl -> URL обязателен и только http(s)
-    # telnet/ping/dig -> URL должен быть пустым( чтобы не было мусора)
 
     if "curl" in methods:
         # для curl URL обязателен и должен быть http(s)
@@ -574,22 +586,13 @@ def validate_row_rules(row: list[str]) -> list[str]:
             errs.append(
                 f"URL проверки при curl должен начинаться с http:// или https:// (получено: '{url}')"
             )
-        if is_empty(url):
-            errs.append(
-                "URL проверки должна быть пустая для метода(ов) {methods} (получено: '{url}')"
-            )
     else:
-        # для всех остальных методов URL НЕ обязателен
-        # но если заполнен - просто проверим, что это похоже на URL
+        # если метод рне curl - URL Должен быть пустым
         if not is_empty(url):
-            if not (
-                url.lower().startswith("http://")
-                or url.lower().startswith("https://")
-                or "." in url  # разрешаем домены типа v-a.yandex.ru
-            ):
-
-                errs.append(f"URL проверки имеет формат: '{url}')")
-    return errs
+            m_str = ",".join(methods)
+            errs.append(
+                f"URL проверки должен быть пустым для методов {m_str} (получено: '{url}')"
+            )
 
 
 # -------------------------------------------------
@@ -611,9 +614,12 @@ def run_main_validate(
         sys.executable,
         str(project_dir / "main.py"),
         "validate",
-        "--input", str(fixed_csv),
-        "--output", str(out_csv),
-        "--max-errors", "10000",
+        "--input",
+        str(fixed_csv),
+        "--output",
+        str(out_csv),
+        "--max-errors",
+        "10000",
     ]
     if skip_whois:
         cmd.append("--skip-whois")
@@ -641,8 +647,9 @@ def run_main_validate(
         out_lines.append(line)
         print(line, end="", flush=True)
 
-    rc = p.wait()    
+    rc = p.wait()
     return "".join(out_lines), rc
+
 
 def write_text(path: Path, text: str):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -670,30 +677,6 @@ def _is_valid_ipv4(ip: str) -> bool:
         return False
     parts = ip.split(".")
     return all(0 <= int(p) <= 255 for p in parts)
-
-
-def _parse_ip_port(value: str):
-    """Возвращает (ip, port_int) или (None,  None) если формат неверный"""
-    s = (value or "").strip()
-    m = IPPORT_RE.match(s)
-    if not m:
-        return None, None
-
-    ip = m.group(1).strip()
-    port_str = m.group(2).strip()
-
-    try:
-        port = int(port_str)
-    except ValueError:
-        return None, None
-
-    if port < 1 or port > 65535:
-        return None, None
-
-    if not _is_valid_ipv4(ip):
-        return None, None
-
-    return ip, port
 
 
 def _is_http_url(url: str) -> bool:
@@ -988,7 +971,9 @@ def main():
                 rs.print_startup_warning("Кодировка: UTF-8")
             else:
                 rs.print_startup_warning(f"Кодировка: {enc}")
-                rs.print_startup_warning("ВНИМАНИЕ: файл CSV сохранен не в UTF-8. ")
+
+            if not enc.lower().startswith("utf-8"):
+                rs.print_startup_warning("ВНИМАНИЕ: файл CSV сохранен не в UTF-8.")
 
             lines = text.splitlines()
             print(f"3) after splitlines: lines={len(lines)}", flush=True)
@@ -1006,16 +991,18 @@ def main():
             elif "¦" in header_line:
                 delim = "¦"
                 rs.print_startup_warning(
-                    "Обнаружен нестандартный разделитель '¦' (Excel)."
+                    "ВНИМАНИЕ: Обнаружен нестандартный разделитель '¦' (не по Инструкции)."
                 )
             elif "│" in header_line:
                 delim = "│"
-                rs.print_startup_warning("Обнаружен нестандартный разделитель '│'.")
+                rs.print_startup_warning(
+                    "ВНИМАНИЕ: Обнаружен нестандартный разделитель '│' (не по Инструкции)."
+                )
             else:
                 rs.print_error(
-                    "Не найден разделитель '|'. Файл должен быть сохранен как CSV с разделителем |"
+                    "Не найден разделитель '|'. По Инструкции файл должен быть сохранен как CSV с разделителем |"
                 )
-                delim = "|"
+                continue
 
             # 3) Парсим CSV
             rows, header = parse_rows_iter(text, delim)
@@ -1113,14 +1100,12 @@ def main():
                         f"   +{extra}: строки {ranges} (всего {len(rows_list)})"
                     )
 
-            print("7) after row loop", flush=True)        
+            print("7) after row loop", flush=True)
 
             rs.print_startup_warning(f"Итого строк данных: {total}")
             # rs.print_startup_warning(f"Строк с ошибками: {bad}")
 
             # 6) Готовим FIXED CSV и запускаем main.py
-
-           
 
             fixed_dir = reports_all_dir / "_temp"
             main_out_csv = reports_all_dir / f"{csv_file.stem}_MAIN_result.csv"
@@ -1158,7 +1143,6 @@ def main():
                     f"Не удалось подготовить FIXED CSV / запустить main.py: {e}"
                 )
 
-                                  
             # ВСЕГДА пишем лог main.py
             main_log_txt.write_text(main_log, encoding="utf-8", errors="replace")
 
