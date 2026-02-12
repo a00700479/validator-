@@ -384,31 +384,41 @@ def split_csv_list(value: str) -> list[str]:
     return parts
 
 
-def normalize_protocols(value: str) -> set[str]:
+def normalize_protocols(raw: str) -> list[str]:
     """
     Protocol может быть: tcp, udp, оба, tcp,udp, udp,tcp, tcp/udp.
-    Возвращаем множество {'tcp','udp'} и т.п.
+    Возвращает список нормализованных протоколов (например: ["tcp","udp"]).
     """
+    if not raw:
+        return []
 
-    # гарантируем, что v всегда определена
-    v = (value or "").strip().lower()
-    if not v:
-        return set()
+    s = str(raw).replace("\ufeff", "").strip().lower()
+    if not s:
+        return []
 
-    v = v.replace("/", ",").replace(";", ",")
-    v = re.sub(r"\s+", "", v)
+    # алиасы
+    if s in ("оба", "both", "tcp/udp", "udp/tcp"):
+        return ["tcp", "udp"]
 
-    if v in {"оба", "both"}:
-        return {"tcp", "udp"}
+    # поддержка tcp/udp
+    s = s.replace("/", ",")
 
-    parts = [p for p in v.split(",") if p]
-    out: set[str] = set()
+    parts = [p.strip() for p in s.split(",") if p.strip()]
 
+    norm = []
     for p in parts:
-        if p in {"оба", "both"}:
-            out.update({"tcp", "udp"})
-        else:
-            out.add(p)
+        p = p.replace(" ", "").replace("-", "")  # udp-lite -> udplite
+        if p in ("udplite", "udpl"):
+            p = "udplite"
+        norm.append(p)
+
+    # убираем дубли, сохраняя порядок
+    seen = set()
+    out = []
+    for p in norm:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
 
     return out
 
@@ -472,19 +482,21 @@ def validate_row_rules(row: list[str]) -> list[str]:
     mask = cell(row, IDX_MASK)
 
     # 1) Пустые обязательные ячейки (по REQUIRED_COLUMNS из config.colomns)
-    for col in REQUIRED_COLUMNS:
+    REQUIRED_COLUMNS_PRECHECK = [
+        c for c in REQUIRED_COLUMNS if c.name != "Проверочный IP+Порт"
+    ]
+    for col in REQUIRED_COLUMNS_PRECHECK:
         v = cell(row, col.index)
         if is_empty(v):
             errs.append(f"Пустое обязательное поле: '{col.name}'")
 
     # 2) Protocol: tcp/udp/оба
     protocols = normalize_protocols(protocol_raw)
-    if protocols:
-        bad = [p for p in protocols if p not in VALID_PROTOCOLS]
-        if bad:
-            errs.append(
-                f"Недопустимое значение Protocol: {bad} (ожидается tcp/udp или оба)"
-            )
+    bad = [p for p in protocols if p not in VALID_PROTOCOLS]
+    if bad:
+        errs.append(
+            f"Недопустимое значение Protocol: {bad} (допустимо: {', '.join(sorted(VALID_PROTOCOLS))})"
+        )
     # если указан Protocol, но ячейка Port пустая - то это ошибка (собираем противоречие)
     if (not is_empty(protocol_raw)) and is_empty(port):
         errs.append("Указан Protocol, но ячейка Port пустая")
@@ -531,15 +543,17 @@ def validate_row_rules(row: list[str]) -> list[str]:
         if is_empty(sni):
             errs.append("Для HTTPS (tcp) обязательно поле 'SNI/HTTP HOST'")
 
-    # 6.1) Проверка: IP из "Проверочный IP+Порт" + принадлежность сети network_id/mask
+    # 6.1) Проверка: Проверочный IP(+порт) и принадлежность сети network_id/mask
 
-    allow_ip_without_port = ("ping" in methods) and ("telnet" not in methods)
+    allow_ip_without_port = "ping" in methods
+
     # Если поле пустое:
     if is_empty(check_ipport):
-        # Пусто допустимо только если есть ping (telnet без порта не  допускаем)
+        # Пусто допустимо ТОЛЬКО если есть ping (ping может идти по DNS)
         if "ping" not in methods:
             errs.append("Проверочный IP+Порт: обязательное поле (нужно ip:port)")
     else:
+        # поле заполнено -> для ping можно без порта, иначе строго ip:port
         ip_str = parse_ip_from_ipport(check_ipport, allow_no_port=allow_ip_without_port)
         if ip_str is None:
             if allow_ip_without_port:
@@ -550,48 +564,48 @@ def validate_row_rules(row: list[str]) -> list[str]:
                 errs.append("Проверочный IP+Порт: неверный формат (ожидается ip:port)")
         else:
             # проверка принадлежности сети - только если сеть и маска заданы
-            if not is_empty(network_id) and not is_empty(mask):
-
+            if (not is_empty(network_id)) and (not is_empty(mask)):
                 prefix = parse_mask_prefix(mask)
                 if prefix is None:
                     errs.append(f"MASK: неверный формат (ожидается '/число'): {mask!r}")
                 else:
-                    try:
-                        ip_obj = ipaddress.ip_address(ip_str)
-                        net_obj = ipaddress.ip_network(
-                            f"{network_id}/{prefix}", strict=False
-                        )
+                    # правило ТЗ: /24 -> network ID для IPv4 должен оканчиваться на .0
+                    if prefix == 24:
+                        nid = (network_id or "").strip()
+                        if nid and (":" not in nid) and (not nid.endswith(".0")):
+                            errs.append(
+                                "MASK /24: для IPv4 поле 'Сеть в формате network ID' должно оканчиваться на .0 (пример: 213.59.252.0)"
+                            )
 
-                        # контроль версии: v4/v6 должны совпадать
-                        if ip_obj.version != net_obj.version:
-                            errs.append(
-                                f"Несовпадение IPv4/IPv6: сеть '{network_id}{mask}', проверочный IP '{ip_str}'"
-                            )
-                        elif ip_obj not in net_obj:
-                            errs.append(
-                                f"Проверочный IP '{ip_str}' не принадлежит сети '{net_obj}'"
-                            )
-                    except ValueError:
+                try:
+                    ip_obj = ipaddress.ip_address(ip_str)
+                    net_obj = ipaddress.ip_network(
+                        f"{network_id}/{prefix}", strict=False
+                    )
+
+                    if ip_obj.version != net_obj.version:
                         errs.append(
-                            f"Сеть.MASK: некорректные значения: network='{network_id}', mask='{mask}'"
+                            f"Несовпадение IPv4/IPv6: сеть '{network_id}{mask}', проверочный IP '{ip_str}'"
                         )
+                    elif ip_obj not in net_obj:
+                        errs.append(
+                            f"Проверочный IP '{ip_str}' не принадлежит сети '{net_obj}'"
+                        )
+                except ValueError:
+                    errs.append(
+                        f"Сеть.MASK: некорректные значения: network={network_id!r}, mask={mask!r}"
+                    )
 
-    # 7) URL проверки: строго по форме
+    # 7) URL проверки
+    # curl -> URL обязателен и строго http(s)
+    # остальные методы -> URL не требуем пустым (не ругаемся)
 
     if "curl" in methods:
-        # для curl URL обязателен и должен быть http(s)
         if is_empty(url):
             errs.append("Указан curl, но ячейка 'URL проверки' пустая")
         elif not _is_http_url(url):
             errs.append(
-                f"URL проверки при curl должен начинаться с http:// или https:// (получено: '{url}')"
-            )
-    else:
-        # если метод рне curl - URL Должен быть пустым
-        if not is_empty(url):
-            m_str = ",".join(methods)
-            errs.append(
-                f"URL проверки должен быть пустым для методов {m_str} (получено: '{url}')"
+                f"URL проверки при curl должен начинаться с http:// или https:// (получено: {url!r})"
             )
 
 

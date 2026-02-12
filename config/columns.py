@@ -3,7 +3,7 @@ from typing import Optional
 
 
 @dataclass
-class ColumnDefinition:    
+class ColumnDefinition:
     index: int
     name: str
     required: bool
@@ -38,6 +38,5 @@ REQUIRED_COLUMNS = [col for col in COLUMNS if col.required]
 # Valid values for specific columns
 VALID_IP_VERSIONS = {"v4", "v6"}
 VALID_CDN_VALUES = {"yes", "no"}
-VALID_PROTOCOLS = {"tcp", "udp", "esp"}
+VALID_PROTOCOLS = {"tcp", "udp", "esp", "sctp", "dccp", "quic", "udplite"}
 VALID_CHECK_METHODS = {"ping", "telnet", "curl", "dig"}
-
