@@ -211,6 +211,52 @@ def parse_mask_prefix(mask: str) -> int | None:
         return int(mm.group(1))
     except ValueError:
         return None
+    
+PORT_TOKEN_RE = re.compile(r"^\d{1,5}$")
+PORT_RANGE_RE = re.compile(r"^(\d{1,5})-(\d{1,5})$")
+
+def _is_valid_port(n: int) -> bool:
+    return 1 <= n <= 65535
+
+def parse_port_spec(port_raw: str) -> bool:
+    """
+    Допускается:
+      - "" (пусто) -> ok
+      - "80"
+      - "80,443,8080"
+      - "1000-2000"
+      - "241,1000-2000"
+    """
+    s = (port_raw or "").replace("\ufeff", "").strip().strip('"').strip("'")
+    if not s:
+        return True
+
+    # Excel иногда показывает точки вместо запятых (80.443.8080)
+    # Мягко: если похоже на список через точки - считаем это списком
+    if "." in s and "," not in s and re.fullmatch(r"\d+(?:\.\d+)+", s):
+        s = s.replace(".", ",")
+
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if not parts:
+        return False
+
+    for p in parts:
+        m = PORT_RANGE_RE.match(p)
+        if m:
+            a = int(m.group(1)); b = int(m.group(2))
+            if not (_is_valid_port(a) and _is_valid_port(b) and a <= b):
+                return False
+            continue
+
+        if PORT_TOKEN_RE.match(p):
+            n = int(p)
+            if not _is_valid_port(n):
+                return False
+            continue
+
+        return False
+
+    return True    
 
 
 def parse_ip_from_ipport(value: str, allow_no_port: bool) -> str | None:
@@ -498,10 +544,11 @@ def validate_row_rules(row: list[str]) -> list[str]:
             f"Недопустимое значение Protocol: {bad} (допустимо: {', '.join(sorted(VALID_PROTOCOLS))})"
         )
     # если указан Protocol, но ячейка Port пустая - то это ошибка (собираем противоречие)
-    if (not is_empty(protocol_raw)) and is_empty(port):
-        errs.append("Указан Protocol, но ячейка Port пустая")
-    if (not is_empty(port)) and is_empty(protocol_raw):
-        errs.append("Указан Port, но ячейка Protocol пустая")
+    
+    if not parse_port_spec(port):
+        errs.append(f"Port: неверный формат (ожидается 80 | 80, 443 | 1000-2000 | 241, 1000-2000): {port!r}")    
+
+
 
     # 3) Способ проверки: может быть список
     methods = [m.strip().lower() for m in split_csv_list(method_raw)]
@@ -516,12 +563,8 @@ def validate_row_rules(row: list[str]) -> list[str]:
     if "telnet" in methods:
         # - telnet требует IP: (даже если есть ping - telnet все равно нужен порт)
         if is_empty(check_ipport):
-            errs.append("Указан telnet, но ячейка 'Проверочный IP+Порт' пустая")
-        else:
-            ip_str = parse_ip_from_ipport(check_ipport, allow_no_port=False)
-            if ip_str is None:
-                errs.append("Проверочный IP+Порт: для telnet ожидается ip:port")
-            # URL не нужен, но не считаем ошибкой, если заполнен
+            errs.append("Указан telnet, но ячейка 'Проверочный IP+Порт' пустая (нужно ip:port)")
+        
 
     if "ping" in methods:
         # - ping может работать либо по IP(берем из Проверочный IP+Порт), либо по DNS Host
@@ -543,32 +586,57 @@ def validate_row_rules(row: list[str]) -> list[str]:
         if is_empty(sni):
             errs.append("Для HTTPS (tcp) обязательно поле 'SNI/HTTP HOST'")
 
-    # 6.1) Проверка: Проверочный IP(+порт) и принадлежность сети network_id/mask
+    # -----------------------------------------------------------
+    # 6) Проверочный IP+Порт — правило ТЗ
+    # IP без порта разрешён только если есть ping
+    # если есть telnet — порт обязателен
+    # -----------------------------------------------------------
 
-    allow_ip_without_port = "ping" in methods
+    # единое правило
+    allow_ip_without_port = ("ping" in methods) and ("telnet" not in methods)
 
-    # Если поле пустое:
     if is_empty(check_ipport):
-        # Пусто допустимо ТОЛЬКО если есть ping (ping может идти по DNS)
+        # пусто допустимо только если есть ping
         if "ping" not in methods:
             errs.append("Проверочный IP+Порт: обязательное поле (нужно ip:port)")
+        ip_str = None
     else:
-        # поле заполнено -> для ping можно без порта, иначе строго ip:port
-        ip_str = parse_ip_from_ipport(check_ipport, allow_no_port=allow_ip_without_port)
+        ip_str = parse_ip_from_ipport(
+            check_ipport,
+            allow_no_port=allow_ip_without_port
+        )
+
         if ip_str is None:
             if allow_ip_without_port:
                 errs.append(
                     "Проверочный IP+Порт: ожидается ip или ip:port (для ping можно без порта)"
                 )
             else:
-                errs.append("Проверочный IP+Порт: неверный формат (ожидается ip:port)")
+                errs.append(
+                    "Проверочный IP+Порт: неверный формат (ожидается ip:port)"
+                )
+
+
+
         else:
             # проверка принадлежности сети - только если сеть и маска заданы
-            if (not is_empty(network_id)) and (not is_empty(mask)):
+            if ip_str and (not is_empty(network_id)) and (not is_empty(mask)):
+
                 prefix = parse_mask_prefix(mask)
                 if prefix is None:
                     errs.append(f"MASK: неверный формат (ожидается '/число'): {mask!r}")
                 else:
+                    
+                    if ":" in (network_id or ""):
+                        # IPv6
+                        if not (0 <= prefix <= 128):
+                            errs.append(f"MASK: для IPv6 допустимо /0..128 (получено: /{prefix})")
+                    else:
+                        # IPv4
+                        if not (0 <= prefix <= 32):
+                            errs.append(f"MASK: для IPv4 допустимо /0..32 (получено: /{prefix})")
+                                            
+
                     # правило ТЗ: /24 -> network ID для IPv4 должен оканчиваться на .0
                     if prefix == 24:
                         nid = (network_id or "").strip()
@@ -600,13 +668,21 @@ def validate_row_rules(row: list[str]) -> list[str]:
     # curl -> URL обязателен и строго http(s)
     # остальные методы -> URL не требуем пустым (не ругаемся)
 
+    m_str = ",".join(methods)
+
     if "curl" in methods:
         if is_empty(url):
             errs.append("Указан curl, но ячейка 'URL проверки' пустая")
         elif not _is_http_url(url):
-            errs.append(
-                f"URL проверки при curl должен начинаться с http:// или https:// (получено: {url!r})"
-            )
+            errs.append(f"URL проверки при curl должен начинаться с http:// или https:// (получено: {url!r})")
+    else:
+        # “по запросу” разрешаем: URL непустой (может быть контактом)
+        if "по запросу" in methods:
+            if is_empty(url):
+                errs.append("Указано 'по запросу', но 'URL проверки' пустая (нужно указать контакт)")
+        else:
+            if not is_empty(url):
+                errs.append(f"URL проверки должен быть пустым для методов {m_str} (получено: {url!r})")
 
 
 # -------------------------------------------------

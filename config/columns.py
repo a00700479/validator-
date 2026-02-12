@@ -39,4 +39,4 @@ REQUIRED_COLUMNS = [col for col in COLUMNS if col.required]
 VALID_IP_VERSIONS = {"v4", "v6"}
 VALID_CDN_VALUES = {"yes", "no"}
 VALID_PROTOCOLS = {"tcp", "udp", "esp", "sctp", "dccp", "quic", "udplite"}
-VALID_CHECK_METHODS = {"ping", "telnet", "curl", "dig"}
+VALID_CHECK_METHODS = {"ping", "telnet", "curl", "dig", "nmap", "по запросу"}
