@@ -703,7 +703,7 @@ def validate_row_rules(row: list[str]) -> list[str]:
             errs.append(
                 f"URL проверки должен быть пустым для методов {m_str} (получено: {url!r})"
             )
-
+    return errs
 
 # -------------------------------------------------
 # Запуск main.py validate
