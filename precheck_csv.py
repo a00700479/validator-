@@ -564,17 +564,17 @@ def validate_row_rules(row: list[str]) -> list[str]:
         if m not in VALID_CHECK_METHODS:
             errs.append(f"Недопустимый способ проверки: '{m}'")
 
-    # 4) Правила по методам из таблицы Word
+    # 4) Правила по методам из таблицы
 
-    if "telnet" in methods:
-        # - telnet требует IP: (даже если есть ping - telnet все равно нужен порт)
-        if is_empty(check_ipport):
-            errs.append(
-                "Указан telnet, но ячейка 'Проверочный IP+Порт' пустая (нужно ip:port)"
-            )
+    # telnet -> порт обязателен (но пустоту проверяет общее правило ниже)
 
+    if "telnet" in methods and not is_empty(check_ipport):
+        ip_tel = parse_ip_from_ipport(check_ipport, allow_no_port=False)
+        if ip_tel is None:
+            errs.append("Проверочный IP+Порт: для telnet ожидается ip:port")
+
+    # ping -> нужен либо IP, либо DNS
     if "ping" in methods:
-        # - ping может работать либо по IP(берем из Проверочный IP+Порт), либо по DNS Host
         if is_empty(check_ipport) and is_empty(dns):
             errs.append(
                 "Указан ping, но нет ни IP (Проверочный IP+Порт), ни DNS Host для проверки"

@@ -140,7 +140,7 @@ def cmd_validate(args) -> int:
         input_file=input_files[0],  # Keep first file for compatibility
         output_file=args.output,
         blacklist_file=args.blacklist,
-        whois_enabled=not args.skip_whois,
+        whois_enabled=False, 
     )
     
     # Initialize services
