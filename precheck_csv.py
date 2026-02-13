@@ -609,15 +609,11 @@ def validate_row_rules(row: list[str]) -> list[str]:
     if is_empty(check_ipport):
         # пусто допустимо только если есть ping
         if has_telnet:
-            errs.append(
-                "Проверочный IP+Порт: обязательное поле для telnet (нужно ip:port)"
-            )
+            errs.append("Проверочный IP+Порт: обязательное поле для telnet (нужно ip:port)")
         elif has_ping:
             # ping может проверять по DNS, поэтому пусто допустимо ТОЛЬКО если DNS заполнен
             if is_empty(dns):
-                errs.append(
-                    "Проверочный IP+Порт: укажите IP (ip или ip:port) или заполните DNS Host для ping"
-                )
+                errs.append("Проверочный IP+Порт: укажите IP (ip или ip:port) или заполните DNS Host для ping")
             else:
                 errs.append("Проверочный IP+Порт: обязательное поле (нужно ip:port)")
             ip_str = None
@@ -626,9 +622,7 @@ def validate_row_rules(row: list[str]) -> list[str]:
 
         if ip_str is None:
             if allow_ip_without_port:
-                errs.append(
-                    "Проверочный IP+Порт: ожидается ip или ip:port (для ping можно без порта)"
-                )
+                errs.append("Проверочный IP+Порт: ожидается ip или ip:port (для ping можно без порта)")
             else:
                 errs.append("Проверочный IP+Порт: неверный формат (ожидается ip:port)")
 
@@ -816,7 +810,7 @@ def add_group(counts: dict, rows_all: dict, key: str, line_no: int | None = None
         rows_all[key].append(line_no)
 
 
-def dump_groups(rs, title: str, counts: dict, rows_all: dict):
+def dump_groups(rs, title: str, counts: dict, rows_all: dict, top_n: int | None = None):
     """Печатает сгруппированные ошибки по убыванию частоты"""
     if not counts:
         rs.print_startup_warning(f"{title}: нет")
@@ -824,8 +818,13 @@ def dump_groups(rs, title: str, counts: dict, rows_all: dict):
 
     rs.print_startup_warning(title + ":")
 
+    items = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+
+    shown = items if (top_n is None) else items[:top_n]
+    hidden = 0 if (top_n is None) else max(0, len(items) - top_n)
+
     # сортируем по количеству (самые частые сверху)
-    for msg, cnt in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
+    for msg, cnt in shown:
         all_rows = sorted(set(rows_all.get(msg, [])))
         if all_rows:
             rs.print_startup_warning(
@@ -833,6 +832,11 @@ def dump_groups(rs, title: str, counts: dict, rows_all: dict):
             )
         else:
             rs.print_startup_warning(f"• ({cnt} шт.) {msg}")
+
+    if hidden:
+        rs.print_startup_warning(
+                f"\n(Скрыто еще {hidden} типов проблем - полный список см. в *_PRECHECK_FULL.txt)"
+            )        
 
 
 def build_excel_report(
@@ -1069,6 +1073,7 @@ def main():
         rows_all = defaultdict(list)  # ВСЕ номера строк
 
         precheck_report_path = reports_all_dir / f"{csv_file.stem}_PRECHECK.txt"
+        precheck_full_report_path = reports_all_dir / f"{csv_file.stem}_PRECHECK_FULL.txt"
 
         # 1) читаем файл как текст
         print("1) before detect_encoding", flush=True)
@@ -1263,9 +1268,37 @@ def main():
             main_log_txt.write_text(main_log, encoding="utf-8", errors="replace")
 
             # Итоговая сводка по PRECHECK
-            dump_groups(rs, "Сводка проблем (сгруппировано)", counts, rows_all)
+            dump_groups(rs, "Сводка проблем (сгруппировано)", counts, rows_all, top_n=20)
 
         print("Отчет сохранен:", precheck_report_path)
+
+        # FULL: тот же отчёт, но со всей сводкой (без top_n)
+        with open(precheck_full_report_path, "w", encoding="utf-8-sig") as f_full:
+            rs_full = ReportService(output=f_full)
+
+            rs_full.print_startup_warning(f"Проверка файла: {csv_file.name}")
+            rs_full.print_startup_warning(f"Кодировка: {enc}")
+            if not enc.lower().startswith("utf-8"):
+                rs_full.print_startup_warning("ВНИМАНИЕ: файл CSV сохранен не в UTF-8.")
+
+            rs_full.print_startup_warning(
+                f"Колонок в файле: {len(header)} (по Инструкции должно быть {len(COLUMN_NAMES)})"
+            )
+
+        # (опционально) продублируем заголовки-расхождения
+            mism = compare_headers_strict(header[: len(COLUMN_NAMES)], COLUMN_NAMES)
+            if mism:
+                rs_full.print_startup_warning("Заголовки: есть расхождения (регистр/написание):")
+                for col_no, expected, got in mism:
+                    rs_full.print_startup_warning(f"  - Колонка {col_no}: '{got}' -> должно быть '{expected}'")
+            else:
+                rs_full.print_startup_warning("Заголовки: ОК")
+
+            rs_full.print_startup_warning(f"Итого строк данных: {total}")
+
+            dump_groups(rs_full, "Сводка проблем (полная)", counts, rows_all, top_n=None)
+
+        print("FULL-отчет сохранен:", precheck_full_report_path)
 
         # ✅ ВАЖНО: общий отчёт делаем ЗДЕСЬ, ПОСЛЕ try/except — всегда
 
